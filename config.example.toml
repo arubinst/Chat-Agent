@@ -1,0 +1,30 @@
+# Chat Agent Configuration
+# Copy this file to config.toml and edit with your settings.
+
+[llm]
+# OpenAI-compatible API endpoint
+base_url = "http://localhost:11434/v1"  # Ollama default
+api_key = "ollama"                       # API key (use "ollama" for Ollama)
+model = "qwen2.5"                        # Model name
+# Optional system prompt to set assistant behavior
+system_prompt = "You are a helpful assistant running in a terminal. Format responses in plain text, not markdown."
+
+# MCP Server Configuration
+# Supported types: "stdio", "sse", "file"
+
+# Example: stdio transport (runs a command)
+# [[mcp_servers]]
+# type = "stdio"
+# command = "uv"
+# args = ["run", "server.py"]
+# cwd = "/path/to/server"  # optional working directory
+
+# Example: SSE transport (connects to remote server)
+# [[mcp_servers]]
+# type = "sse"
+# url = "http://localhost:8000/sse"
+
+# Example: local Python file (fastmcp runs it directly)
+# [[mcp_servers]]
+# type = "file"
+# path = "my_server.py"
