@@ -14,6 +14,12 @@ from pathlib import Path
 from openai import OpenAI
 from fastmcp import Client
 from fastmcp.client.transports import StdioTransport
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.prompt import Prompt
+
+console = Console()
 
 
 def load_config():
@@ -92,8 +98,8 @@ class ChatAgent:
     
     async def connect(self):
         """Connect to all MCP servers and discover their tools."""
-        print("Discovering MCP servers and tools...\n")
-        
+        console.print("Discovering MCP servers and tools...\n", style="bold blue")
+
         for server in MCP_SERVERS:
             # Server can be a string, StdioTransport, or other transport
             if isinstance(server, str):
@@ -102,12 +108,12 @@ class ChatAgent:
                 server_name = f"{server.command} {' '.join(server.args)}"
             else:
                 server_name = str(server)
-            
+
             try:
                 client = Client(server)
                 await client.__aenter__()
                 self.mcp_clients.append((server_name, client))
-                
+
                 # Get tools from this server
                 server_tools = await client.list_tools()
                 for t in server_tools:
@@ -120,13 +126,13 @@ class ChatAgent:
                         },
                         "_client": client  # Keep reference to call it later
                     })
-                print(f"  [OK] {server_name}")
+                console.print(f"  [OK] {server_name}", style="green")
                 for t in server_tools:
-                    print(f"      - {t.name}")
+                    console.print(f"       - {t.name}", style="dim")
             except Exception as e:
-                print(f"  [FAIL] {server_name}: {e}")
-        
-        print(f"\nTotal: {len(self.tools)} tools from {len(self.mcp_clients)} servers\n")
+                console.print(f"  [FAIL] {server_name}: {e}", style="red")
+
+        console.print(f"\nTotal: {len(self.tools)} tools from {len(self.mcp_clients)} servers\n", style="bold")
     
     async def disconnect(self):
         """Disconnect from all MCP servers."""
@@ -192,8 +198,8 @@ class ChatAgent:
                     tool_name = tool_call.function.name
                     tool_args = json.loads(tool_call.function.arguments) if tool_call.function.arguments else {}
                     
-                    print(f"  [TOOL] {tool_name}({json.dumps(tool_args)})")
-                    
+                    console.print(f"  [TOOL] {tool_name}({json.dumps(tool_args)})", style="yellow")
+
                     # Find the right MCP client and call the tool
                     client = self._get_client_for_tool(tool_name)
                     if client:
@@ -204,10 +210,10 @@ class ChatAgent:
                                 result_text = str(result.content)
                             else:
                                 result_text = str(result)
-                            print(f"     → {result_text[:80]}{'...' if len(result_text) > 80 else ''}")
+                            console.print(f"      -> {result_text[:80]}{'...' if len(result_text) > 80 else ''}", style="dim")
                         except Exception as e:
                             result_text = f"Error: {e}"
-                            print(f"     → Error: {e}")
+                            console.print(f"      -> Error: {e}", style="red")
                     else:
                         result_text = f"Error: Tool '{tool_name}' not found"
                     
@@ -236,33 +242,37 @@ async def main():
     agent = ChatAgent(system_prompt=system_prompt)
     await agent.connect()
     
-    print("=" * 50)
-    print("Chat Agent Ready!")
-    print("Type 'quit' to exit, 'clear' to reset history")
-    print("=" * 50)
-    
+    console.print(Panel(
+        "Type 'quit' to exit, 'clear' to reset history",
+        title="Chat Agent Ready",
+        border_style="green"
+    ))
+
     try:
         while True:
             try:
-                user_input = input("\nYou: ").strip()
+                console.print()
+                user_input = Prompt.ask("[bold cyan]You[/bold cyan]")
             except EOFError:
                 break
-                
+
             if user_input.lower() in ('quit', 'exit', 'q'):
                 break
             if user_input.lower() == 'clear':
                 agent.clear_history()
-                print("(conversation cleared)")
+                console.print("(conversation cleared)", style="dim italic")
                 continue
             if not user_input:
                 continue
-            
+
             response = await agent.chat(user_input)
-            print(f"\nAssistant: {response}")
-    
+            console.print()
+            console.print("[bold magenta]Assistant:[/bold magenta]")
+            console.print(Markdown(response))
+
     finally:
         await agent.disconnect()
-        print("\nGoodbye!")
+        console.print("\nGoodbye!", style="bold blue")
 
 
 if __name__ == "__main__":

@@ -164,12 +164,14 @@ source = { virtual = "." }
 dependencies = [
     { name = "fastmcp" },
     { name = "openai" },
+    { name = "rich" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "fastmcp", specifier = ">=2.14.4" },
     { name = "openai", specifier = ">=2.16.0" },
+    { name = "rich", specifier = ">=14.0.0" },
 ]
 
 [[package]]
