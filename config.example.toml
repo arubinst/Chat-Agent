@@ -18,6 +18,7 @@ system_prompt = "You are a helpful assistant running in a terminal. Format respo
 # command = "uv"
 # args = ["run", "server.py"]
 # cwd = "/path/to/server"  # optional working directory
+# env = { API_KEY = "secret", DEBUG = "true" }  # optional environment variables
 
 # Example: SSE transport (connects to remote server)
 # [[mcp_servers]]

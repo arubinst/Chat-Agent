@@ -43,7 +43,8 @@ def build_mcp_servers(config):
             servers.append(StdioTransport(
                 command=server["command"],
                 args=server.get("args", []),
-                cwd=server.get("cwd")
+                cwd=server.get("cwd"),
+                env=server.get("env")
             ))
         elif server_type == "sse":
             servers.append(server["url"])
