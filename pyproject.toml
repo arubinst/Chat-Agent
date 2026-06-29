@@ -5,7 +5,11 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "fastmcp>=2.14.4",
+    "boto3>=1.43.29",
+    "chainlit>=2.11.1",
+    "fastmcp>=3.0.0",
+    "langchain-core>=1.4.0",
+    "langgraph>=1.2.0",
     "openai>=2.16.0",
     "rich>=14.0.0",
 ]

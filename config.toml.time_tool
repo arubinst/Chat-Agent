@@ -1,0 +1,35 @@
+[llm]
+base_url = "http://100.74.122.107:1234/v1"
+api_key = "lm-studio"
+model = "qwen/qwen3.5-9b"
+#model = "gpt-oss-120b-derestricted-mlx"
+#model = "openai/gpt-oss-120b"
+#model = "qwen3.5-397b-a17b"
+#model = "zai-org/glm-4.7-flash"
+#system_prompt = "You are a helpful assistant running in a terminal. Format responses in plain text, not markdown. Keep responses concise."
+
+#base_url = "https://api.openai.com/v1"
+#api_key = "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"
+#model = "gpt-5.2"
+# system_prompt = "optional"
+system_prompt = """You are a helpful AI assistant with access to tools via MCP (Model Context Protocol).
+Available tools come from multiple MCP servers as indicated by the [server_name] prefix in tool descriptions. You can use any combination of tools to help the user.
+This is an interactive conversation. The user can ask follow-up questions and you should maintain context from previous exchanges.
+Key guidelines:
+1. Always start by finding out the current date, time and timezone.
+2. Use tools to gather information, perform actions, and solve problems. BE PROACTIVE!!!
+3. Be conversational and refer back to previous interactions when relevant
+4. If you need to perform multiple related actions, plan your approach and execute it.
+5. Always explain what you're doing when using tools
+6. Handle errors gracefully and try alternative approaches if needed
+7. Keep responses concise but informative
+8. When saving data to disk, do not add any additional path to the filename. Use the root of the folders proposed by the save tool
+To exit the conversation, the user can type 'exit', 'quit', or press Ctrl+C."""
+
+# MCP Time Server
+[[mcp_servers]]
+name = "time"
+type = "stdio"
+command = "uv"
+args = ["run", "/Users/arubinst/mcp-servers/Time-MCP-Server/time_server.py"]
+env = { FASTMCP_SHOW_CLI_BANNER = "false", FASTMCP_SHOW_SERVER_BANNER = "false" }

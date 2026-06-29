@@ -21,6 +21,27 @@ from rich.prompt import Prompt
 
 console = Console()
 
+def read_user_input() -> str:
+    first_line = Prompt.ask("[bold cyan]You[/bold cyan]")
+
+    if first_line.strip() == "```":
+        console.print("[dim]Multiline mode. Finish with ``` on its own line.[/dim]")
+        lines = []
+
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                break
+
+            if line.strip() == "```":
+                break
+
+            lines.append(line)
+
+        return "\n".join(lines)
+
+    return first_line
 
 def load_config():
     """Load configuration from config.toml."""
@@ -253,7 +274,8 @@ async def main():
         while True:
             try:
                 console.print()
-                user_input = Prompt.ask("[bold cyan]You[/bold cyan]")
+                #user_input = Prompt.ask("[bold cyan]You[/bold cyan]")
+                user_input = read_user_input()
             except EOFError:
                 break
 

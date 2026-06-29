@@ -1,0 +1,15 @@
+[llm]
+base_url = "http://100.74.122.107:1234/v1"
+api_key = "lm-studio"
+model = "qwen/qwen3.5-9b"
+#model = "gpt-oss-120b-derestricted-mlx"
+#model = "openai/gpt-oss-120b"
+#model = "qwen3.5-397b-a17b"
+#model = "zai-org/glm-4.7-flash"
+#system_prompt = "You are a helpful assistant running in a terminal. Format responses in plain text, not markdown. Keep responses concise."
+
+#base_url = "https://api.openai.com/v1"
+#api_key = "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"
+#model = "gpt-5.2"
+# system_prompt = "optional"
+system_prompt = """You are a helpful AI assistant"""

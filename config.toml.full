@@ -1,0 +1,138 @@
+[llm]
+base_url = "http://100.74.122.107:1234/v1"
+api_key = "lm-studio"
+model = "qwen/qwen3.5-9b"
+#model = "gpt-oss-120b-derestricted-mlx"
+#model = "openai/gpt-oss-120b"
+#model = "qwen3.5-397b-a17b"
+#model = "zai-org/glm-4.7-flash"
+#system_prompt = "You are a helpful assistant running in a terminal. Format responses in plain text, not markdown. Keep responses concise."
+
+#base_url = "https://api.openai.com/v1"
+#api_key = "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"
+#model = "gpt-5.2"
+# system_prompt = "optional"
+system_prompt = """You are a helpful AI assistant with access to tools via MCP (Model Context Protocol).
+Available tools come from multiple MCP servers as indicated by the [server_name] prefix in tool descriptions. You can use any combination of tools to help the user.
+This is an interactive conversation. The user can ask follow-up questions and you should maintain context from previous exchanges.
+Key guidelines:
+1. Always start by finding out the current date, time and timezone.
+2. Use tools to gather information, perform actions, and solve problems. BE PROACTIVE!!!
+3. Be conversational and refer back to previous interactions when relevant
+4. If you need to perform multiple related actions, plan your approach and execute it.
+5. Always explain what you're doing when using tools
+6. Handle errors gracefully and try alternative approaches if needed
+7. Keep responses concise but informative
+8. When saving data to disk, do not add any additional path to the filename. Use the root of the folders proposed by the save tool
+To exit the conversation, the user can type 'exit', 'quit', or press Ctrl+C."""
+
+# Web search (Brave)
+[[mcp_servers]]
+name = "brave-search"
+type = "stdio"
+command = "npx"
+args = ["-y", "@brave/brave-search-mcp-server"]
+env = { BRAVE_API_KEY = "BSAFNsjdmmpt8ZTS8lE4sCsyeIpodyk" }
+
+# Anthropic fetch
+[[mcp_servers]]
+name = "fetch"
+type = "stdio"
+command = "uvx"
+args = ["mcp-server-fetch"]
+
+# kazuph mcp-fetch (with image support)
+[[mcp_servers]]
+name = "fetch-images"
+type = "stdio"
+command = "npx"
+args = ["-y", "@kazuph/mcp-fetch"]
+
+# MCP Time Server
+[[mcp_servers]]
+name = "time"
+type = "stdio"
+command = "uv"
+args = ["run", "/Users/arubinst/Documents/Work/armasuisse/mcp-time/time_server.py"]
+env = { FASTMCP_SHOW_CLI_BANNER = "false", FASTMCP_SHOW_SERVER_BANNER = "false" }
+
+# GDELT Server
+[[mcp_servers]]
+name = "gdelt"
+type = "stdio"
+command = "/Users/arubinst/Documents/Work/armasuisse/claude/mcp-gdelt-scraper/venv/bin/python"
+args = ["-m", "gdelt_server.server"]
+
+#[[mcp_servers]]
+#name = "context7"
+#type = "stdio"
+#command = "npx"
+#args = ["-y", "@upstash/context7-mcp", "--api-key", "ctx7sk-2498b1ed-0395-4292-a36d-69defbdb43d3"]
+
+#[[mcp_servers]]
+#name = "sosumi"
+#type = "sse"
+#url = "https://sosumi.ai/mcp"
+
+# Openstreetmap Server
+[[mcp_servers]]
+name = "osm"
+type = "stdio"
+command = "uvx"
+args = ["osm-mcp-server"]
+
+# Sentinel Server
+[[mcp_servers]]
+name = "sentinel"
+type = "stdio"
+command = "uv"
+args = [
+  "--directory",
+  "/Users/arubinst/Documents/Work/armasuisse/mcp-sentinel-scraper.bak",
+  "run",
+  "sentinel-scraper",
+]
+env = { SENTINELHUB_CLIENT_ID = "sh-7398ceaa-8e34-433b-91fc-921c95face0c", SENTINELHUB_CLIENT_SECRET = "nimE2ngyghcqWPmiBZkCOtMYrIx5Lf8m", SENTINEL_OUTPUT_DIR = "/Users/arubinst/scraped_data/images" }
+
+# Geocode Server
+[[mcp_servers]]
+name = "geocode"
+type = "stdio"
+command = "uvx"
+args = ["geocode-mcp"]
+
+# Disk access Server for saving and reading
+[[mcp_servers]]
+name = "data-saver"
+type = "stdio"
+command = "/Users/arubinst/Documents/Work/armasuisse/claude/mcp-data-saver/.venv/bin/mcp-data-saver"
+args = []
+env = { MCP_BASE_DIR = "/Users/arubinst/scraped_data" }
+
+# X Scraping server
+[[mcp_servers]]
+name = "x-scraper"
+type = "stdio"
+command = "/Users/arubinst/mcp-x-scraper/.venv/bin/mcp-x-scraper"
+args = []
+env = { MCP_BASE_DIR = "/Users/arubinst/mcp-x-scraper/sandbox", SCRAPERAPI_KEY = "ca105dd544e37cf6598dcfe23603bbf2" }
+
+# Telegram Server
+[[mcp_servers]]
+name = "telegram"
+type = "stdio"
+command = "uv"
+args = ["--directory", "/Users/arubinst/Documents/Work/armasuisse/telegram-mcp", "run", "main.py"]
+
+# code execution sandbox
+[[mcp_servers]]
+name = "llm-sandbox"
+command = "uv"
+args = [
+        "run",
+        "--directory",
+        "/Users/arubinst/MCP/llm-sandbox",
+        "python",
+        "-m",
+        "llm_sandbox.mcp_server.server"
+      ]

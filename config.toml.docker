@@ -1,0 +1,115 @@
+[llm]
+#base_url = "http://100.95.158.11:1234/v1"
+#api_key = "lm-studio"
+#model = "openai/gpt-oss-120b"
+
+base_url = "https://litellm.intlab.ch/v1"
+api_key = "sk-o02Ny6i2dRxIImI8L_xxIw"
+model = "moonshotai/Kimi-K2.6"
+system_prompt = """You are the ARRIVE policy analyst agent. Your job is to analyze Kubernetes workloads and detect security policy gaps by driving the arrive-policy-mcp pipeline.
+
+When the user provides a Kubernetes manifest (or other IaC spec), follow this workflow:
+
+1. Call analyze_iac with the provided spec to produce a workload profile. When calling analyze_iac, use format k8s_manifest for Kubernetes YAML manifests.
+2. Ask the user which security posture to use (relaxed, standard, hardened, paranoid) if not specified. Default to standard.
+3. Call generate_requirements with the workload profile and posture to get a list of policy requirements. Present the requirements to the user for review.
+4. For each approved requirement, call generate_single_policy to produce Rego code, then call validate_rego to check it compiles. If compilation fails, retry generate_single_policy once (the LLM may produce a different decomposition on a second attempt). If it fails again, log the requirement as "generation failed" and continue with the next one. Cosmetic lint warnings (package-directory mismatch, opa-fmt) are expected and not failures. Always process all requirements regardless of individual successes or failures. At the end, report which policies compiled successfully and which could not be generated.
+5. Call fetch_deployed_policies with context kind-driftlab to retrieve what is currently deployed on the cluster.
+6. Call detect_gaps with the requirements and deployed policies to produce a gap report. Present the findings clearly.
+
+Always explain what you are doing at each step. When presenting results, summarize findings in plain text rather than dumping raw JSON. Highlight critical and high severity gaps first."""
+
+[[mcp_servers]]
+name = "arrive-policy"
+type = "stdio"
+command = "uv"
+args = ["run", "--directory", "/Users/arubinst/mcp-servers/arrive-policy-mcp", "arrive-policy-mcp"]
+#env = { KUBECONFIG = "/Users/arubinst/.kube/driftlab-config", LLM_PROVIDER = "openai_compatible", LLM_BASE_URL = "https://litellm.intlab.ch/v1", LLM_MODEL = "moonshotai/Kimi-K2.6", LLM_API_KEY = "sk-o02Ny6i2dRxIImI8L_xxIw" }
+env = { KUBECONFIG = "/Users/arubinst/.kube/driftlab-config", LLM_PROVIDER = "openai_compatible", LLM_BASE_URL = "http://100.95.158.11:1234/v1", LLM_MODEL = "openai/gpt-oss-120b", LLM_API_KEY = "sk-o02Ny6i2dRxIImI8L_xxIw" }
+
+[[mcp_servers]]
+name = "docker-mcp-gateway"
+type = "stdio"
+command = "docker"
+args = ["mcp", "gateway", "run", "--profile", "my_tools"]
+
+# Web search (Brave)
+[[mcp_servers]]
+name = "brave-search"
+type = "stdio"
+command = "npx"
+args = ["-y", "@brave/brave-search-mcp-server"]
+env = { BRAVE_API_KEY = "BSAFNsjdmmpt8ZTS8lE4sCsyeIpodyk" }
+
+# Anthropic fetch
+[[mcp_servers]]
+name = "fetch"
+type = "stdio"
+command = "uvx"
+args = ["mcp-server-fetch"]
+
+# kazuph mcp-fetch (with image support)
+[[mcp_servers]]
+name = "fetch-images"
+type = "stdio"
+command = "npx"
+args = ["-y", "@kazuph/mcp-fetch"]
+
+# GDELT Server
+#[[mcp_servers]]
+#nMW = "gdelt-mcp"
+#type = "stdio"
+#command = "/Users/arubinst/Documents/Projects/RESONATE/ng/claude/mcp-gdelt-scraper/venv/bin/python"
+#args = ["-m", "gdelt_server.server" ]
+
+#[[mcp_servers]]
+#type = "stdio"
+#command = "npx"
+#args = ["-y", "@upstash/context7-mcp", "--api-key", "ctx7sk-2498b1ed-0395-4292-a36d-69defbdb43d3"]
+
+[[mcp_servers]]
+name = "sosumi"
+type = "sse"
+url = "https://sosumi.ai/mcp"
+
+# Openstreetmap Server
+[[mcp_servers]]
+name = "openstreetmap-server"
+type = "stdio"
+command = "uvx"
+args = [ "osm-mcp-server" ]
+
+# Sentinel Server
+[[mcp_servers]]
+name = "sentinel-server"
+type = "stdio"
+command = "uv"
+args = [
+  "--directory",
+  "/Users/arubinst/Documents/Projects/RESONATE/ng/claude/mcp-sentinel-scraper.bak",
+  "run",
+  "sentinel-scraper",
+]
+env = { SENTINELHUB_CLIENT_ID = "sh-7398ceaa-8e34-433b-91fc-921c95face0c", SENTINELHUB_CLIENT_SECRET = "nimE2ngyghcqWPmiBZkCOtMYrIx5Lf8m", SENTINEL_OUTPUT_DIR = "/Users/arubinst/scraped_data/images" }
+
+# Geocode Server
+[[mcp_servers]]
+name = "geocode-server"
+type = "stdio"
+command = "uvx"
+args = ["geocode-mcp"]
+
+# X Scraping server
+[[mcp_servers]]
+name = "x-scraper-server"
+type = "stdio"
+command = "/Users/arubinst/Documents/Projects/RESONATE/ng/mcp-x-scraper/.venv/bin/mcp-x-scraper"
+args = []
+env = { MCP_BASE_DIR = "/Users/arubinst/mcp-x-scraper/sandbox", SCRAPERAPI_KEY = "ca105dd544e37cf6598dcfe23603bbf2" }
+
+# Telegram Server
+[[mcp_servers]]
+name = "telegram-server"
+type = "stdio"
+command = "uv"
+args = ["--directory", "/Users/arubinst/Documents/Projects/RESONATE/ng/telegram-mcp", "run", "main.py"]
