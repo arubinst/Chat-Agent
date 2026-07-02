@@ -6,13 +6,14 @@
 # time. A dropped/idle connection now self-heals on the next call instead of
 # leaving a dead session that only a full restart could recover.
 
+import asyncio
 import json
 import re
 import tomllib
 from pathlib import Path
 
 import chainlit as cl
-from openai import OpenAI
+from openai import AsyncOpenAI
 from fastmcp import Client
 from fastmcp.client.transports import StdioTransport
 
@@ -59,16 +60,18 @@ def build_mcp_servers(config):
 
 config = load_config()
 
-llm = OpenAI(
+llm = AsyncOpenAI(
     base_url=config["llm"]["base_url"],
     api_key=config["llm"]["api_key"],
 )
 
+LLM_STREAM_TIMEOUT_SECONDS = 180
+MCP_DISCOVERY_TIMEOUT_SECONDS = 30
+MCP_TOOL_TIMEOUT_SECONDS = 120
+S3_FETCH_TIMEOUT_SECONDS = 30
+
 MODEL = config["llm"]["model"]
 MCP_SERVERS = build_mcp_servers(config)
-
-import boto3
-from botocore.config import Config
 
 _storage_cfg = config["storage"]
 _s3 = boto3.client(
@@ -160,8 +163,9 @@ class ChatAgent:
                 # a dead session that only an agent restart can fix.
                 client = Client(server)
 
-                async with client:
-                    server_tools = await client.list_tools()
+                async with asyncio.timeout(MCP_DISCOVERY_TIMEOUT_SECONDS):
+                    async with client:
+                        server_tools = await client.list_tools()
 
                 self.mcp_clients.append((server_name, client))
 
@@ -188,11 +192,15 @@ class ChatAgent:
                 )
 
             except Exception as e:
+                if isinstance(e, TimeoutError):
+                    error_text = f"Timed out after {MCP_DISCOVERY_TIMEOUT_SECONDS}s during MCP tool discovery."
+                else:
+                    error_text = str(e)
                 discovered.append(
                     {
                         "server": server_name,
                         "ok": False,
-                        "error": str(e),
+                        "error": error_text,
                         "tools": [],
                     }
                 )
@@ -216,7 +224,10 @@ class ChatAgent:
         if not image_id:
             return "Error: image_id is required."
         try:
-            data, _ctype = fetch_image(image_id)
+            async with asyncio.timeout(S3_FETCH_TIMEOUT_SECONDS):
+                data, _ctype = await asyncio.to_thread(fetch_image, image_id)
+        except TimeoutError:
+            return f"Error: timed out after {S3_FETCH_TIMEOUT_SECONDS}s while fetching image {image_id}."
         except Exception as e:
             return f"Error: could not fetch image {image_id}: {e}"
         img = cl.Image(name=image_id, content=data, display="inline")
@@ -233,53 +244,59 @@ class ChatAgent:
         self.messages.append({"role": "user", "content": user_message})
 
         while True:
-            stream = llm.chat.completions.create(
-                model=MODEL,
-                messages=self.messages,
-                tools=self._tools_for_api() if self.tools else None,
-                tool_choice="auto" if self.tools else None,
-                stream=True,
-            )
-
             content_parts: list[str] = []
             tool_calls_by_index: dict[int, dict] = {}
 
-            for chunk in stream:
-                if not chunk.choices:
-                    continue
+            try:
+                async with asyncio.timeout(LLM_STREAM_TIMEOUT_SECONDS):
+                    stream = await llm.chat.completions.create(
+                        model=MODEL,
+                        messages=self.messages,
+                        tools=self._tools_for_api() if self.tools else None,
+                        tool_choice="auto" if self.tools else None,
+                        stream=True,
+                    )
 
-                delta = chunk.choices[0].delta
+                    async for chunk in stream:
+                        if not chunk.choices:
+                            continue
 
-                if delta.content:
-                    content_parts.append(delta.content)
+                        delta = chunk.choices[0].delta
 
-                    # We stream raw content for responsiveness.
-                    # If the model emits <think>...</think>, it will be cleaned after completion.
-                    await response_msg.stream_token(delta.content)
+                        if delta.content:
+                            content_parts.append(delta.content)
 
-                if delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        index = tc.index
+                            # We stream raw content for responsiveness.
+                            # If the model emits <think>...</think>, it will be cleaned after completion.
+                            await response_msg.stream_token(delta.content)
 
-                        if index not in tool_calls_by_index:
-                            tool_calls_by_index[index] = {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": "",
-                                    "arguments": "",
-                                },
-                            }
+                        if delta.tool_calls:
+                            for tc in delta.tool_calls:
+                                index = tc.index
 
-                        if tc.id:
-                            tool_calls_by_index[index]["id"] = tc.id
+                                if index not in tool_calls_by_index:
+                                    tool_calls_by_index[index] = {
+                                        "id": tc.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": "",
+                                            "arguments": "",
+                                        },
+                                    }
 
-                        if tc.function:
-                            if tc.function.name:
-                                tool_calls_by_index[index]["function"]["name"] += tc.function.name
+                                if tc.id:
+                                    tool_calls_by_index[index]["id"] = tc.id
 
-                            if tc.function.arguments:
-                                tool_calls_by_index[index]["function"]["arguments"] += tc.function.arguments
+                                if tc.function:
+                                    if tc.function.name:
+                                        tool_calls_by_index[index]["function"]["name"] += tc.function.name
+
+                                    if tc.function.arguments:
+                                        tool_calls_by_index[index]["function"]["arguments"] += tc.function.arguments
+            except TimeoutError as e:
+                raise RuntimeError(
+                    f"Timed out after {LLM_STREAM_TIMEOUT_SECONDS}s while waiting for the model response."
+                ) from e
 
             full_content = "".join(content_parts)
             tool_calls = list(tool_calls_by_index.values())
@@ -336,14 +353,17 @@ class ChatAgent:
                                 # session was dropped (idle timeout, gateway
                                 # session invalidation, ~60s SSE termination,
                                 # etc.) this call transparently re-establishes it.
-                                async with client:
-                                    result = await client.call_tool(tool_name, tool_args)
+                                async with asyncio.timeout(MCP_TOOL_TIMEOUT_SECONDS):
+                                    async with client:
+                                        result = await client.call_tool(tool_name, tool_args)
 
                                 if hasattr(result, "content"):
                                     result_text = str(result.content)
                                 else:
                                     result_text = str(result)
 
+                            except TimeoutError:
+                                result_text = f"Error: tool '{tool_name}' timed out after {MCP_TOOL_TIMEOUT_SECONDS}s."
                             except Exception as e:
                                 result_text = f"Error: {e}"
                         else:
@@ -445,7 +465,8 @@ async def on_message(message: cl.Message):
         await agent.chat(user_text, response_msg=response_msg)
 
     except Exception as e:
-        response_msg.content = f"Error while processing message:\n\n```text\n{e}\n```"
+        error_text = str(e) or e.__class__.__name__
+        response_msg.content = f"Error while processing message:\n\n```text\n{error_text}\n```"
         await response_msg.update()
 
 
