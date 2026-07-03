@@ -69,6 +69,7 @@ LLM_STREAM_TIMEOUT_SECONDS = 300
 MCP_DISCOVERY_TIMEOUT_SECONDS = 60
 MCP_TOOL_TIMEOUT_SECONDS = 240
 S3_FETCH_TIMEOUT_SECONDS = 30
+REFRESH_WINDOW_MESSAGE = "resonate:refresh"
 
 MODEL = config["llm"]["model"]
 MCP_SERVERS = build_mcp_servers(config)
@@ -463,6 +464,7 @@ async def on_message(message: cl.Message):
 
     try:
         await agent.chat(user_text, response_msg=response_msg)
+        await cl.send_window_message(REFRESH_WINDOW_MESSAGE)
 
     except Exception as e:
         error_text = str(e) or e.__class__.__name__
