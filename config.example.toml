@@ -2,6 +2,9 @@
 # Copy this file to config.toml and edit with your settings.
 
 [llm]
+# Supported providers: "openai-compatible" (Ollama, OpenAI-compatible gateways)
+# or "anthropic" (native Anthropic Messages API).
+provider = "openai-compatible"
 # OpenAI-compatible API endpoint
 base_url = "http://localhost:11434/v1"  # Ollama default
 api_key = "ollama"                       # API key (use "ollama" for Ollama)

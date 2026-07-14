@@ -22,6 +22,7 @@ from urllib.request import Request, build_opener, HTTPRedirectHandler
 from datetime import datetime, timezone
 
 import chainlit as cl
+from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 from fastmcp import Client
 from fastmcp.client.transports import (
@@ -92,6 +93,7 @@ def build_mcp_servers(config):
 config = load_config()
 
 LLM_STREAM_TIMEOUT_SECONDS = 300
+ANTHROPIC_MAX_TOKENS = 4096
 MCP_DISCOVERY_TIMEOUT_SECONDS = 60
 MCP_TOOL_TIMEOUT_SECONDS = 240
 S3_FETCH_TIMEOUT_SECONDS = 30
@@ -101,6 +103,7 @@ PDF_IMAGE_MAX_PIXELS = (1400, 1400)
 REMOTE_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\((https?://[^\s)]+)\)", re.IGNORECASE)
 
 MODEL = config["llm"]["model"]
+DEFAULT_LLM_PROVIDER = config["llm"].get("provider", "openai-compatible")
 MCP_SERVERS = build_mcp_servers(config)
 
 _storage_cfg = config["storage"]
@@ -132,6 +135,16 @@ def validate_llm_endpoint(endpoint: str) -> str:
         )
 
     return normalized
+
+
+def restore_config_defaults(agent: "ChatAgent"):
+    """Restore all runtime LLM settings, including the non-displayed config key."""
+    agent.update_llm_connection(
+        config["llm"]["base_url"],
+        config["llm"]["api_key"],
+        config["llm"]["model"],
+        DEFAULT_LLM_PROVIDER,
+    )
 
 
 def _is_public_image_url(url: str) -> bool:
@@ -285,13 +298,20 @@ class ChatAgent:
         base_url: str = config["llm"]["base_url"],
         api_key: str = config["llm"]["api_key"],
         model: str = MODEL,
+        provider: str = DEFAULT_LLM_PROVIDER,
     ):
+        if provider not in {"openai-compatible", "anthropic"}:
+            raise ValueError(
+                "llm.provider must be either 'openai-compatible' or 'anthropic'."
+            )
         self.system_prompt = system_prompt
+        self.provider = provider
         self.base_url = validate_llm_endpoint(base_url)
         self.api_key = api_key
         self.model = model
-        self.llm = AsyncOpenAI(base_url=self.base_url, api_key=self.api_key)
+        self.llm = self._build_llm_client()
         self.messages = []
+        self.anthropic_messages = []
         #self.tools = []
         # modified to include the dismplay_image tool as a local tool available to the agent, in addition to any tools discovered from MCP servers
         self.tools = list(LOCAL_TOOL_SCHEMAS)
@@ -303,6 +323,7 @@ class ChatAgent:
 
     def _init_messages(self):
         self.messages = []
+        self.anthropic_messages = []
         if self.system_prompt:
             self.messages.append(
                 {"role": "system", "content": self.system_prompt}
@@ -313,16 +334,24 @@ class ChatAgent:
         self.export_entries.clear()
         self._current_response_images.clear()
 
-    def update_llm_connection(self, base_url: str, api_key: str, model: str):
+    def _build_llm_client(self):
+        if self.provider == "anthropic":
+            return AsyncAnthropic(api_key=self.api_key, base_url=self.base_url)
+        return AsyncOpenAI(base_url=self.base_url, api_key=self.api_key)
+
+    def update_llm_connection(self, base_url: str, api_key: str, model: str, provider: str):
         """Replace this session's LLM settings without changing shared config."""
         model = model.strip()
         if not model:
             raise ValueError("Model must not be empty.")
+        if provider not in {"openai-compatible", "anthropic"}:
+            raise ValueError("Unsupported LLM provider.")
 
         self.base_url = validate_llm_endpoint(base_url)
         self.api_key = api_key
         self.model = model
-        self.llm = AsyncOpenAI(base_url=self.base_url, api_key=self.api_key)
+        self.provider = provider
+        self.llm = self._build_llm_client()
         self.clear_history()
 
     async def connect(self):
@@ -422,10 +451,134 @@ class ChatAgent:
             for t in self.tools
         ]
 
+    def _tools_for_anthropic(self):
+        return [
+            {
+                "name": t["function"]["name"],
+                "description": t["function"]["description"],
+                "input_schema": t["function"]["parameters"],
+            }
+            for t in self.tools
+        ]
+
+    async def _anthropic_response(self, response_msg: cl.Message):
+        content_parts: list[str] = []
+        tool_calls: dict[int, dict] = {}
+        assistant_blocks: list[dict] = []
+        async with asyncio.timeout(LLM_STREAM_TIMEOUT_SECONDS):
+            async with self.llm.messages.stream(
+                model=self.model,
+                max_tokens=ANTHROPIC_MAX_TOKENS,
+                system=self.system_prompt or "",
+                messages=self.anthropic_messages,
+                tools=self._tools_for_anthropic() if self.tools else [],
+                tool_choice={"type": "auto"} if self.tools else None,
+            ) as stream:
+                async for event in stream:
+                    if event.type == "content_block_start":
+                        block = event.content_block
+                        if block.type == "tool_use":
+                            tool_calls[event.index] = {
+                                "id": block.id,
+                                "type": "function",
+                                "function": {"name": block.name, "arguments": ""},
+                            }
+                    elif event.type == "content_block_delta":
+                        delta = event.delta
+                        if delta.type == "text_delta":
+                            content_parts.append(delta.text)
+                            await response_msg.stream_token(delta.text)
+                        elif delta.type == "input_json_delta":
+                            tool_calls[event.index]["function"]["arguments"] += delta.partial_json
+        for index in sorted(tool_calls):
+            call = tool_calls[index]
+            raw_args = call["function"]["arguments"] or "{}"
+            try:
+                tool_input = json.loads(raw_args)
+            except json.JSONDecodeError:
+                tool_input = {}
+            assistant_blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": call["id"],
+                    "name": call["function"]["name"],
+                    "input": tool_input,
+                }
+            )
+        if content_parts:
+            assistant_blocks.insert(0, {"type": "text", "text": "".join(content_parts)})
+        return "".join(content_parts), list(tool_calls.values()), assistant_blocks
+
+    async def _chat_anthropic(self, response_msg: cl.Message) -> str:
+        while True:
+            try:
+                full_content, tool_calls, assistant_blocks = await self._anthropic_response(response_msg)
+            except TimeoutError as e:
+                raise RuntimeError(
+                    f"Timed out after {LLM_STREAM_TIMEOUT_SECONDS}s while waiting for the model response."
+                ) from e
+
+            if tool_calls:
+                response_msg.content = full_content
+                await response_msg.update()
+                self.anthropic_messages.append({"role": "assistant", "content": assistant_blocks})
+                tool_results = []
+                for tool_call in tool_calls:
+                    tool_name = tool_call["function"]["name"]
+                    try:
+                        tool_args = json.loads(tool_call["function"]["arguments"] or "{}")
+                    except json.JSONDecodeError as e:
+                        result_text = f"Error: invalid JSON arguments: {e}"
+                    else:
+                        if tool_name in self.local_tools:
+                            try:
+                                result_text = await self.local_tools[tool_name](tool_args)
+                            except Exception as e:
+                                result_text = f"Error: {e}"
+                        else:
+                            async with cl.Step(name=f"Tool: {tool_name}") as step:
+                                step.input = json.dumps(tool_args, indent=2)
+                                client = self._get_client_for_tool(tool_name)
+                                if client:
+                                    try:
+                                        async with asyncio.timeout(MCP_TOOL_TIMEOUT_SECONDS):
+                                            async with client:
+                                                result = await client.call_tool(tool_name, tool_args)
+                                        result_text = str(result.content) if hasattr(result, "content") else str(result)
+                                    except TimeoutError:
+                                        result_text = f"Error: tool '{tool_name}' timed out after {MCP_TOOL_TIMEOUT_SECONDS}s."
+                                    except Exception as e:
+                                        result_text = f"Error: {e}"
+                                else:
+                                    result_text = f"Error: Tool '{tool_name}' not found"
+                                step.output = result_text[:4000]
+                            self.export_entries.append({"kind": "tool", "name": tool_name})
+                    tool_results.append(
+                        {"type": "tool_result", "tool_use_id": tool_call["id"], "content": result_text}
+                    )
+                self.anthropic_messages.append({"role": "user", "content": tool_results})
+                response_msg = cl.Message(content="")
+                await response_msg.send()
+                continue
+
+            response_msg.content = full_content
+            await response_msg.update()
+            self.anthropic_messages.append(
+                {"role": "assistant", "content": [{"type": "text", "text": full_content}]}
+            )
+            self.export_entries.append(
+                {"kind": "assistant", "content": full_content, "images": list(self._current_response_images)}
+            )
+            return full_content
+
     async def chat(self, user_message: str, response_msg: cl.Message) -> str:
         self.messages.append({"role": "user", "content": user_message})
+        self.anthropic_messages.append({"role": "user", "content": user_message})
         self.export_entries.append({"kind": "user", "content": user_message})
         self._current_response_images = []
+
+        if self.provider == "anthropic":
+            return await self._chat_anthropic(response_msg)
 
         while True:
             content_parts: list[str] = []
@@ -610,16 +763,32 @@ async def send_pdf_export(agent: ChatAgent, mode: str):
 @cl.on_chat_start
 async def on_chat_start():
     system_prompt = config["llm"].get("system_prompt")
-    agent = ChatAgent(system_prompt=system_prompt)
+    agent = ChatAgent(
+        system_prompt=system_prompt,
+        provider=DEFAULT_LLM_PROVIDER,
+    )
     cl.user_session.set("agent", agent)
 
     settings = cl.ChatSettings(
         [
+            cl.input_widget.Select(
+                id="llm_provider",
+                label="LLM provider",
+                initial=agent.provider,
+                items={
+                    "openai-compatible": "OpenAI-compatible",
+                    "anthropic": "Anthropic / Claude",
+                },
+                description="Select Anthropic / Claude only for the native Anthropic Messages API.",
+            ),
             cl.input_widget.TextInput(
                 id="llm_endpoint",
                 label="LLM endpoint",
                 initial=agent.base_url,
-                description="OpenAI-compatible base URL used for this browser session.",
+                description=(
+                    "Base URL used for this browser session. For native Anthropic, "
+                    "use https://api.anthropic.com (without /v1)."
+                ),
                 placeholder="https://api.example.com/v1",
             ),
             cl.input_widget.TextInput(
@@ -690,16 +859,26 @@ async def on_settings_update(settings: dict):
     submitted_key = str(settings.get("llm_api_key", ""))
     api_key = submitted_key.strip() or agent.api_key
     model = str(settings.get("llm_model", ""))
+    provider = str(settings.get("llm_provider", ""))
 
     try:
-        agent.update_llm_connection(endpoint, api_key, model)
+        is_config_reset = (
+            provider == DEFAULT_LLM_PROVIDER
+            and validate_llm_endpoint(endpoint) == validate_llm_endpoint(config["llm"]["base_url"])
+            and model.strip() == config["llm"]["model"]
+            and not submitted_key.strip()
+        )
+        if is_config_reset:
+            restore_config_defaults(agent)
+        else:
+            agent.update_llm_connection(endpoint, api_key, model, provider)
     except (TypeError, ValueError) as e:
         await cl.Message(content=f"Could not update LLM connection: {e}").send()
         return
 
     await cl.Message(
         content=(
-            "LLM connection and model updated for this session. Conversation history was "
+            "LLM configuration updated for this session. Conversation history was "
             "cleared; the API key is not displayed or saved to config.toml."
         )
     ).send()
