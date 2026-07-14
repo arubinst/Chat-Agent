@@ -12,6 +12,7 @@ import re
 import tomllib
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 
 import chainlit as cl
 from openai import AsyncOpenAI
@@ -77,11 +78,6 @@ def build_mcp_servers(config):
 
 config = load_config()
 
-llm = AsyncOpenAI(
-    base_url=config["llm"]["base_url"],
-    api_key=config["llm"]["api_key"],
-)
-
 LLM_STREAM_TIMEOUT_SECONDS = 300
 MCP_DISCOVERY_TIMEOUT_SECONDS = 60
 MCP_TOOL_TIMEOUT_SECONDS = 240
@@ -106,6 +102,20 @@ S3_BUCKET = _storage_cfg["bucket"]
 def fetch_image(image_id: str) -> tuple[bytes, str]:
     obj = _s3.get_object(Bucket=S3_BUCKET, Key=image_id)
     return obj["Body"].read(), obj.get("ContentType", "application/octet-stream")
+
+
+def validate_llm_endpoint(endpoint: str) -> str:
+    """Validate and normalize an OpenAI-compatible API base URL."""
+    normalized = endpoint.strip().rstrip("/")
+    parsed = urlparse(normalized)
+
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(
+            "Endpoint must be a complete HTTP(S) URL, for example "
+            "https://api.example.com/v1."
+        )
+
+    return normalized
 
 
 LOCAL_TOOL_SCHEMAS = [
@@ -142,8 +152,18 @@ def strip_thinking(text: str) -> str:
 
 
 class ChatAgent:
-    def __init__(self, system_prompt: str | None = None):
+    def __init__(
+        self,
+        system_prompt: str | None = None,
+        base_url: str = config["llm"]["base_url"],
+        api_key: str = config["llm"]["api_key"],
+        model: str = MODEL,
+    ):
         self.system_prompt = system_prompt
+        self.base_url = validate_llm_endpoint(base_url)
+        self.api_key = api_key
+        self.model = model
+        self.llm = AsyncOpenAI(base_url=self.base_url, api_key=self.api_key)
         self.messages = []
         #self.tools = []
         # modified to include the dismplay_image tool as a local tool available to the agent, in addition to any tools discovered from MCP servers
@@ -161,6 +181,13 @@ class ChatAgent:
 
     def clear_history(self):
         self._init_messages()
+
+    def update_llm_connection(self, base_url: str, api_key: str):
+        """Replace this session's LLM client without changing shared config."""
+        self.base_url = validate_llm_endpoint(base_url)
+        self.api_key = api_key
+        self.llm = AsyncOpenAI(base_url=self.base_url, api_key=self.api_key)
+        self.clear_history()
 
     async def connect(self):
         discovered = []
@@ -267,8 +294,8 @@ class ChatAgent:
 
             try:
                 async with asyncio.timeout(LLM_STREAM_TIMEOUT_SECONDS):
-                    stream = await llm.chat.completions.create(
-                        model=MODEL,
+                    stream = await self.llm.chat.completions.create(
+                        model=self.model,
                         messages=self.messages,
                         tools=self._tools_for_api() if self.tools else None,
                         tool_choice="auto" if self.tools else None,
@@ -422,13 +449,35 @@ class ChatAgent:
 async def on_chat_start():
     system_prompt = config["llm"].get("system_prompt")
     agent = ChatAgent(system_prompt=system_prompt)
+    cl.user_session.set("agent", agent)
+
+    settings = cl.ChatSettings(
+        [
+            cl.input_widget.TextInput(
+                id="llm_endpoint",
+                label="LLM endpoint",
+                initial=agent.base_url,
+                description="OpenAI-compatible base URL used for this browser session.",
+                placeholder="https://api.example.com/v1",
+            ),
+            cl.input_widget.TextInput(
+                id="llm_api_key",
+                label="LLM API key",
+                initial="",
+                description=(
+                    "Enter a key to replace the current session key. Leave blank "
+                    "to keep the configured key. This field is not prefilled."
+                ),
+                placeholder="Leave blank to retain the current key",
+            ),
+        ]
+    )
+    await settings.send()
 
     msg = cl.Message(content="Discovering MCP servers and tools...")
     await msg.send()
 
     discovered = await agent.connect()
-
-    cl.user_session.set("agent", agent)
 
     lines = ["# Chat Agent Ready", ""]
 
@@ -455,6 +504,34 @@ async def on_chat_start():
 
     msg.content = "\n".join(lines)
     await msg.update()
+
+
+@cl.on_settings_update
+async def on_settings_update(settings: dict):
+    agent: ChatAgent | None = cl.user_session.get("agent")
+
+    if agent is None:
+        await cl.Message(
+            content="No agent session found. Refresh the page to start a new session."
+        ).send()
+        return
+
+    endpoint = str(settings.get("llm_endpoint", ""))
+    submitted_key = str(settings.get("llm_api_key", ""))
+    api_key = submitted_key.strip() or agent.api_key
+
+    try:
+        agent.update_llm_connection(endpoint, api_key)
+    except (TypeError, ValueError) as e:
+        await cl.Message(content=f"Could not update LLM connection: {e}").send()
+        return
+
+    await cl.Message(
+        content=(
+            "LLM connection updated for this session. Conversation history was "
+            "cleared; the API key is not displayed or saved to config.toml."
+        )
+    ).send()
 
 
 @cl.on_message
