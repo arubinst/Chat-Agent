@@ -182,10 +182,15 @@ class ChatAgent:
     def clear_history(self):
         self._init_messages()
 
-    def update_llm_connection(self, base_url: str, api_key: str):
-        """Replace this session's LLM client without changing shared config."""
+    def update_llm_connection(self, base_url: str, api_key: str, model: str):
+        """Replace this session's LLM settings without changing shared config."""
+        model = model.strip()
+        if not model:
+            raise ValueError("Model must not be empty.")
+
         self.base_url = validate_llm_endpoint(base_url)
         self.api_key = api_key
+        self.model = model
         self.llm = AsyncOpenAI(base_url=self.base_url, api_key=self.api_key)
         self.clear_history()
 
@@ -470,6 +475,13 @@ async def on_chat_start():
                 ),
                 placeholder="Leave blank to retain the current key",
             ),
+            cl.input_widget.TextInput(
+                id="llm_model",
+                label="Model",
+                initial=agent.model,
+                description="Model name used for this browser session.",
+                placeholder="gemma4:latest",
+            ),
         ]
     )
     await settings.send()
@@ -519,16 +531,17 @@ async def on_settings_update(settings: dict):
     endpoint = str(settings.get("llm_endpoint", ""))
     submitted_key = str(settings.get("llm_api_key", ""))
     api_key = submitted_key.strip() or agent.api_key
+    model = str(settings.get("llm_model", ""))
 
     try:
-        agent.update_llm_connection(endpoint, api_key)
+        agent.update_llm_connection(endpoint, api_key, model)
     except (TypeError, ValueError) as e:
         await cl.Message(content=f"Could not update LLM connection: {e}").send()
         return
 
     await cl.Message(
         content=(
-            "LLM connection updated for this session. Conversation history was "
+            "LLM connection and model updated for this session. Conversation history was "
             "cleared; the API key is not displayed or saved to config.toml."
         )
     ).send()
