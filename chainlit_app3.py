@@ -7,12 +7,19 @@
 # leaving a dead session that only a full restart could recover.
 
 import asyncio
+import html
+import io
+import ipaddress
 import json
 import re
+import socket
 import tomllib
 import os
 from pathlib import Path
 from urllib.parse import urlparse
+from urllib.request import Request, build_opener, HTTPRedirectHandler
+
+from datetime import datetime, timezone
 
 import chainlit as cl
 from openai import AsyncOpenAI
@@ -24,6 +31,12 @@ from fastmcp.client.transports import (
 
 import boto3
 from botocore.config import Config
+from PIL import Image as PILImage
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.platypus import Image as PdfImage, Paragraph, SimpleDocTemplate, Spacer
 
 
 
@@ -83,6 +96,9 @@ MCP_DISCOVERY_TIMEOUT_SECONDS = 60
 MCP_TOOL_TIMEOUT_SECONDS = 240
 S3_FETCH_TIMEOUT_SECONDS = 30
 REFRESH_WINDOW_MESSAGE = "resonate:refresh"
+PDF_IMAGE_MAX_BYTES = 10 * 1024 * 1024
+PDF_IMAGE_MAX_PIXELS = (1400, 1400)
+REMOTE_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\((https?://[^\s)]+)\)", re.IGNORECASE)
 
 MODEL = config["llm"]["model"]
 MCP_SERVERS = build_mcp_servers(config)
@@ -116,6 +132,117 @@ def validate_llm_endpoint(endpoint: str) -> str:
         )
 
     return normalized
+
+
+def _is_public_image_url(url: str) -> bool:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    try:
+        addresses = socket.getaddrinfo(parsed.hostname, None, type=socket.SOCK_STREAM)
+        return bool(addresses) and all(ipaddress.ip_address(item[4][0]).is_global for item in addresses)
+    except (OSError, ValueError):
+        return False
+
+
+def fetch_remote_image(url: str) -> bytes:
+    """Download one public image for PDF embedding, with SSRF and size limits."""
+    if not _is_public_image_url(url):
+        raise ValueError("Image URL is not a public HTTP(S) address.")
+
+    class NoRedirect(HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    response = build_opener(NoRedirect).open(
+        Request(url, headers={"User-Agent": "Chat-Agent PDF exporter"}), timeout=10
+    )
+    content_type = response.headers.get_content_type()
+    if not content_type.startswith("image/"):
+        raise ValueError("URL did not return an image.")
+    data = response.read(PDF_IMAGE_MAX_BYTES + 1)
+    if len(data) > PDF_IMAGE_MAX_BYTES:
+        raise ValueError("Image exceeds the 10 MB export limit.")
+    return data
+
+
+def optimize_pdf_image(data: bytes) -> io.BytesIO:
+    """Convert images to page-friendly JPEG data embedded within the PDF."""
+    with PILImage.open(io.BytesIO(data)) as image:
+        image.thumbnail(PDF_IMAGE_MAX_PIXELS)
+        if image.mode in {"RGBA", "LA", "P"}:
+            background = PILImage.new("RGB", image.size, "white")
+            if image.mode != "P":
+                background.paste(image, mask=image.getchannel("A"))
+            else:
+                background.paste(image.convert("RGBA"), mask=image.convert("RGBA").getchannel("A"))
+            image = background
+        else:
+            image = image.convert("RGB")
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=82, optimize=True)
+        output.seek(0)
+        return output
+
+
+def _pdf_image(data: bytes, available_width: float):
+    image_data = optimize_pdf_image(data)
+    with PILImage.open(image_data) as image:
+        width, height = image.size
+    scale = min(available_width / width, 5 * inch / height, 1)
+    return PdfImage(io.BytesIO(image_data.getvalue()), width=width * scale, height=height * scale)
+
+
+def _pdf_paragraphs(text: str, style: ParagraphStyle):
+    text = REMOTE_IMAGE_PATTERN.sub("", text)
+    escaped = html.escape(text)
+    escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
+    escaped = re.sub(r"`(.+?)`", r"<font name='Courier'>\1</font>", escaped)
+    return [Paragraph(part.replace("\n", "<br/>") or " ", style) for part in escaped.split("\n\n")]
+
+
+def build_chat_pdf(entries: list[dict], mode: str) -> bytes:
+    """Build an in-memory PDF; it is never stored in the application's S3 bucket."""
+    if mode == "summary":
+        assistant_entries = [entry for entry in entries if entry["kind"] == "assistant"]
+        if not assistant_entries:
+            raise ValueError("There is no completed assistant response to export.")
+        entries = [assistant_entries[-1]]
+    elif not entries:
+        raise ValueError("There is no conversation to export.")
+
+    output = io.BytesIO()
+    document = SimpleDocTemplate(
+        output, pagesize=A4, rightMargin=48, leftMargin=48, topMargin=48, bottomMargin=48
+    )
+    styles = getSampleStyleSheet()
+    body = ParagraphStyle("ExportBody", parent=styles["BodyText"], leading=15, spaceAfter=8)
+    tool = ParagraphStyle("Tool", parent=body, textColor=colors.HexColor("#555555"), leftIndent=12)
+    story = [Paragraph("Chat Agent Export", styles["Title"])]
+    story.append(Paragraph(datetime.now(timezone.utc).strftime("Generated %Y-%m-%d %H:%M UTC"), styles["Normal"]))
+    story.append(Spacer(1, 16))
+    for entry in entries:
+        kind = entry["kind"]
+        if kind == "tool":
+            story.append(Paragraph(f"<b>Used Tool:</b> {html.escape(entry['name'])}", tool))
+            continue
+        heading = "You" if kind == "user" else "Assistant"
+        story.append(Paragraph(heading, styles["Heading2"]))
+        story.extend(_pdf_paragraphs(entry["content"], body))
+        image_sources = [("remote", url, "") for url in REMOTE_IMAGE_PATTERN.findall(entry["content"])]
+        image_sources.extend(("s3", image["image_id"], image["caption"]) for image in entry.get("images", []))
+        for source_type, source, caption in image_sources:
+            try:
+                data = fetch_image(source)[0] if source_type == "s3" else fetch_remote_image(source)
+                story.append(_pdf_image(data, document.width))
+                if caption:
+                    story.append(Paragraph(html.escape(caption), styles["Italic"]))
+            except Exception as exc:
+                label = caption or source
+                story.append(Paragraph(f"[Image unavailable: {html.escape(label)}]", tool))
+        story.append(Spacer(1, 12))
+    document.build(story)
+    return output.getvalue()
 
 
 LOCAL_TOOL_SCHEMAS = [
@@ -170,6 +297,8 @@ class ChatAgent:
         self.tools = list(LOCAL_TOOL_SCHEMAS)
         self.local_tools = {"display_image": self._display_image}
         self.mcp_clients = []
+        self.export_entries: list[dict] = []
+        self._current_response_images: list[dict] = []
         self._init_messages()
 
     def _init_messages(self):
@@ -181,6 +310,8 @@ class ChatAgent:
 
     def clear_history(self):
         self._init_messages()
+        self.export_entries.clear()
+        self._current_response_images.clear()
 
     def update_llm_connection(self, base_url: str, api_key: str, model: str):
         """Replace this session's LLM settings without changing shared config."""
@@ -282,6 +413,7 @@ class ChatAgent:
             return f"Error: could not fetch image {image_id}: {e}"
         img = cl.Image(name=image_id, content=data, display="inline")
         await cl.Message(content=caption, elements=[img]).send()
+        self._current_response_images.append({"image_id": image_id, "caption": caption})
         return f"Displayed image {image_id} to the user."
 
     def _tools_for_api(self):
@@ -292,6 +424,8 @@ class ChatAgent:
 
     async def chat(self, user_message: str, response_msg: cl.Message) -> str:
         self.messages.append({"role": "user", "content": user_message})
+        self.export_entries.append({"kind": "user", "content": user_message})
+        self._current_response_images = []
 
         while True:
             content_parts: list[str] = []
@@ -421,6 +555,8 @@ class ChatAgent:
 
                         step.output = result_text[:4000]
 
+                    self.export_entries.append({"kind": "tool", "name": tool_name})
+
                     self.messages.append(
                         {
                             "role": "tool",
@@ -446,8 +582,29 @@ class ChatAgent:
                     "content": full_content,
                 }
             )
+            self.export_entries.append(
+                {
+                    "kind": "assistant",
+                    "content": final_response,
+                    "images": list(self._current_response_images),
+                }
+            )
 
             return final_response
+
+
+async def send_pdf_export(agent: ChatAgent, mode: str):
+    pdf_data = await asyncio.to_thread(build_chat_pdf, agent.export_entries, mode)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    export_file = cl.File(
+        name=f"chat-{mode}-{timestamp}.pdf",
+        content=pdf_data,
+        mime="application/pdf",
+        display="inline",
+    )
+    await cl.Message(
+        content=f"Your {mode}-only PDF export is ready.", elements=[export_file]
+    ).send()
 
 
 @cl.on_chat_start
@@ -513,6 +670,7 @@ async def on_chat_start():
     lines.append(f"**Total:** {tool_count} tools from {ok_count} MCP server(s).")
     lines.append("")
     lines.append("Type `/clear` to reset the conversation history.")
+    lines.append("Use `/export-pdf summary` or `/export-pdf full` to download a PDF.")
 
     msg.content = "\n".join(lines)
     await msg.update()
@@ -564,6 +722,15 @@ async def on_message(message: cl.Message):
         await cl.Message(
             content="Conversation history cleared. Humanity gets another chance."
         ).send()
+        return
+
+    export_match = re.fullmatch(r"/export-pdf(?:\s+(summary|full))?", user_text, re.IGNORECASE)
+    if export_match:
+        mode = (export_match.group(1) or "full").lower()
+        try:
+            await send_pdf_export(agent, mode)
+        except Exception as e:
+            await cl.Message(content=f"Could not create PDF export: {e}").send()
         return
 
     response_msg = cl.Message(content="")
