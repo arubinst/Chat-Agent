@@ -10,16 +10,12 @@ import asyncio
 import json
 import re
 import tomllib
-import os
 from pathlib import Path
 
 import chainlit as cl
 from openai import AsyncOpenAI
 from fastmcp import Client
-from fastmcp.client.transports import (
-    StdioTransport,
-    StreamableHttpTransport,
-)
+from fastmcp.client.transports import StdioTransport
 
 import boto3
 from botocore.config import Config
@@ -44,6 +40,7 @@ def build_mcp_servers(config):
 
     for server in config.get("mcp_servers", []):
         server_type = server.get("type", "stdio")
+
         if server_type == "stdio":
             servers.append(
                 StdioTransport(
@@ -53,25 +50,11 @@ def build_mcp_servers(config):
                     env=server.get("env"),
                 )
             )
-        elif server_type == "streamable-http":
-            servers.append(
-                StreamableHttpTransport(
-                    url=server["url"],
-                    headers={
-                        "Authorization": (
-                            f"Bearer {os.environ['MCP_GATEWAY_AUTH_TOKEN']}"
-                        ),
-                    },
-                )
-            )
         elif server_type == "sse":
             servers.append(server["url"])
         elif server_type == "file":
             servers.append(server["path"])
-        else:
-            raise ValueError(
-                f"Unsupported MCP server type: {server_type}"
-            )
+
     return servers
 
 
