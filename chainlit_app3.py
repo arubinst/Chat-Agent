@@ -22,6 +22,7 @@ from urllib.request import Request, build_opener, HTTPRedirectHandler
 from datetime import datetime, timezone
 
 import chainlit as cl
+import mistune
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 from fastmcp import Client
@@ -37,7 +38,18 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
-from reportlab.platypus import Image as PdfImage, Paragraph, SimpleDocTemplate, Spacer
+from reportlab.platypus import (
+    HRFlowable,
+    Image as PdfImage,
+    ListFlowable,
+    ListItem,
+    Paragraph,
+    Preformatted,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
 
 
@@ -101,6 +113,7 @@ REFRESH_WINDOW_MESSAGE = "resonate:refresh"
 PDF_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 PDF_IMAGE_MAX_PIXELS = (1400, 1400)
 REMOTE_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\((https?://[^\s)]+)\)", re.IGNORECASE)
+MARKDOWN_AST = mistune.create_markdown(renderer="ast", plugins=["table"])
 
 MODEL = config["llm"]["model"]
 DEFAULT_LLM_PROVIDER = config["llm"].get("provider", "openai-compatible")
@@ -206,12 +219,121 @@ def _pdf_image(data: bytes, available_width: float):
     return PdfImage(io.BytesIO(image_data.getvalue()), width=width * scale, height=height * scale)
 
 
-def _pdf_paragraphs(text: str, style: ParagraphStyle):
+def _pdf_inline(children: list[dict] | None) -> str:
+    """Convert Mistune inline tokens to the small XML subset ReportLab supports."""
+    parts = []
+    for token in children or []:
+        token_type = token["type"]
+        if token_type == "text":
+            parts.append(html.escape(token.get("raw", "")))
+        elif token_type == "strong":
+            parts.append(f"<b>{_pdf_inline(token.get('children'))}</b>")
+        elif token_type == "emphasis":
+            parts.append(f"<i>{_pdf_inline(token.get('children'))}</i>")
+        elif token_type == "codespan":
+            parts.append(f"<font name='Courier'>{html.escape(token.get('raw', ''))}</font>")
+        elif token_type == "link":
+            url = html.escape(token.get("attrs", {}).get("url", ""), quote=True)
+            label = _pdf_inline(token.get("children"))
+            parts.append(f'<a href="{url}" color="#1a5fb4"><u>{label}</u></a>')
+        elif token_type == "image":
+            # The image itself is embedded separately after the text content.
+            continue
+        elif token_type in {"softbreak", "linebreak"}:
+            parts.append("<br/>")
+        else:
+            parts.append(_pdf_inline(token.get("children")))
+    return "".join(parts)
+
+
+def _pdf_list(token: dict, styles: dict, depth: int = 0):
+    ordered = token.get("attrs", {}).get("ordered", False)
+    items = []
+    for item in token.get("children", []):
+        content = []
+        for child in item.get("children", []):
+            if child["type"] in {"block_text", "paragraph"}:
+                content.append(Paragraph(_pdf_inline(child.get("children")) or " ", styles["body"]))
+            elif child["type"] == "list":
+                content.append(_pdf_list(child, styles, depth + 1))
+        items.append(ListItem(content or [Paragraph(" ", styles["body"])], leftIndent=12))
+    options = {
+        "bulletType": "1" if ordered else "bullet",
+        "leftIndent": 18 + depth * 12,
+        "bulletFontName": "Helvetica",
+        "bulletFontSize": 9,
+        "spaceAfter": 8,
+    }
+    if ordered:
+        options["start"] = str(token.get("attrs", {}).get("start", 1))
+    return ListFlowable(items, **options)
+
+
+def _pdf_table(token: dict, styles: dict, available_width: float):
+    rows = []
+    header_rows = 0
+    for section in token.get("children", []):
+        if section["type"] == "table_head":
+            row_tokens = [section]
+            header_rows = 1
+        else:
+            row_tokens = section.get("children", [])
+        for row in row_tokens:
+            cells = row.get("children", [])
+            rows.append([
+                Paragraph(_pdf_inline(cell.get("children")) or " ", styles["table_header"] if cell.get("attrs", {}).get("head") else styles["table_cell"])
+                for cell in cells
+            ])
+    column_count = max((len(row) for row in rows), default=1)
+    for row in rows:
+        row.extend([Paragraph(" ", styles["table_cell"])] * (column_count - len(row)))
+    table = Table(
+        rows,
+        colWidths=[available_width / column_count] * column_count,
+        repeatRows=header_rows,
+        hAlign="LEFT",
+        splitByRow=1,
+    )
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eaf0f8")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#c7d2df")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    return table
+
+
+def _pdf_markdown(text: str, styles: dict, available_width: float):
+    """Render common Markdown blocks as native ReportLab flowables."""
     text = REMOTE_IMAGE_PATTERN.sub("", text)
-    escaped = html.escape(text)
-    escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
-    escaped = re.sub(r"`(.+?)`", r"<font name='Courier'>\1</font>", escaped)
-    return [Paragraph(part.replace("\n", "<br/>") or " ", style) for part in escaped.split("\n\n")]
+    flowables = []
+    for token in MARKDOWN_AST(text):
+        token_type = token["type"]
+        if token_type in {"blank_line"}:
+            continue
+        if token_type == "heading":
+            level = min(token.get("attrs", {}).get("level", 3), 3)
+            flowables.append(Paragraph(_pdf_inline(token.get("children")) or " ", styles[f"heading_{level}"]))
+        elif token_type == "paragraph":
+            flowables.append(Paragraph(_pdf_inline(token.get("children")) or " ", styles["body"]))
+        elif token_type == "list":
+            flowables.append(_pdf_list(token, styles))
+        elif token_type == "table":
+            flowables.append(_pdf_table(token, styles, available_width))
+            flowables.append(Spacer(1, 8))
+        elif token_type == "block_code":
+            flowables.append(Preformatted(token.get("raw", ""), styles["code_block"]))
+            flowables.append(Spacer(1, 8))
+        elif token_type == "thematic_break":
+            flowables.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#aab7c4"), spaceBefore=8, spaceAfter=12))
+        elif token_type == "block_quote":
+            quote = _pdf_inline(token.get("children"))
+            flowables.append(Paragraph(quote or " ", styles["quote"]))
+    return flowables
 
 
 def build_chat_pdf(entries: list[dict], mode: str) -> bytes:
@@ -229,19 +351,37 @@ def build_chat_pdf(entries: list[dict], mode: str) -> bytes:
         output, pagesize=A4, rightMargin=48, leftMargin=48, topMargin=48, bottomMargin=48
     )
     styles = getSampleStyleSheet()
-    body = ParagraphStyle("ExportBody", parent=styles["BodyText"], leading=15, spaceAfter=8)
+    body = ParagraphStyle("ExportBody", parent=styles["BodyText"], fontName="Helvetica", fontSize=10, leading=15, spaceAfter=8)
     tool = ParagraphStyle("Tool", parent=body, textColor=colors.HexColor("#555555"), leftIndent=12)
+    markdown_styles = {
+        "body": body,
+        "heading_1": ParagraphStyle("MarkdownH1", parent=styles["Heading1"], fontSize=18, leading=23, spaceBefore=16, spaceAfter=8),
+        "heading_2": ParagraphStyle("MarkdownH2", parent=styles["Heading2"], fontSize=14, leading=18, spaceBefore=14, spaceAfter=6),
+        "heading_3": ParagraphStyle("MarkdownH3", parent=styles["Heading3"], fontSize=11.5, leading=15, spaceBefore=12, spaceAfter=5),
+        "table_header": ParagraphStyle("TableHeader", parent=body, fontName="Helvetica-Bold", fontSize=8.5, leading=11, spaceAfter=0),
+        "table_cell": ParagraphStyle("TableCell", parent=body, fontSize=8.5, leading=11, spaceAfter=0),
+        "code_block": ParagraphStyle("CodeBlock", parent=body, fontName="Courier", fontSize=8, leading=10, leftIndent=8, rightIndent=8, backColor=colors.HexColor("#f3f5f7"), borderColor=colors.HexColor("#d8dee5"), borderWidth=0.5, borderPadding=6, spaceBefore=4, spaceAfter=4),
+        "quote": ParagraphStyle("Quote", parent=body, leftIndent=14, borderColor=colors.HexColor("#7c9bbd"), borderWidth=2, borderPadding=8, textColor=colors.HexColor("#455565")),
+    }
     story = [Paragraph("Chat Agent Export", styles["Title"])]
     story.append(Paragraph(datetime.now(timezone.utc).strftime("Generated %Y-%m-%d %H:%M UTC"), styles["Normal"]))
     story.append(Spacer(1, 16))
-    for entry in entries:
+    entry_index = 0
+    while entry_index < len(entries):
+        entry = entries[entry_index]
         kind = entry["kind"]
         if kind == "tool":
-            story.append(Paragraph(f"<b>Used Tool:</b> {html.escape(entry['name'])}", tool))
+            tool_names = []
+            while entry_index < len(entries) and entries[entry_index]["kind"] == "tool":
+                tool_names.append(entries[entry_index]["name"])
+                entry_index += 1
+            story.append(Paragraph(
+                f"<b>Tools used ({len(tool_names)}):</b> {html.escape(', '.join(tool_names))}", tool
+            ))
             continue
         heading = "You" if kind == "user" else "Assistant"
         story.append(Paragraph(heading, styles["Heading2"]))
-        story.extend(_pdf_paragraphs(entry["content"], body))
+        story.extend(_pdf_markdown(entry["content"], markdown_styles, document.width))
         image_sources = [("remote", url, "") for url in REMOTE_IMAGE_PATTERN.findall(entry["content"])]
         image_sources.extend(("s3", image["image_id"], image["caption"]) for image in entry.get("images", []))
         for source_type, source, caption in image_sources:
@@ -254,6 +394,7 @@ def build_chat_pdf(entries: list[dict], mode: str) -> bytes:
                 label = caption or source
                 story.append(Paragraph(f"[Image unavailable: {html.escape(label)}]", tool))
         story.append(Spacer(1, 12))
+        entry_index += 1
     document.build(story)
     return output.getvalue()
 
