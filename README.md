@@ -34,6 +34,26 @@ Copy the example configuration file and edit it with your settings:
 cp config.example.toml config.toml
 ```
 
+### Resonate overlay images in PDF exports
+
+When the agent and Resonate run in the same Docker Compose stack, mount
+Resonate's image volume read-only into the `agent` service so PDF export can
+embed protected map overlays without sending Nginx Basic Auth credentials:
+
+```yaml
+agent:
+  environment:
+    RESONATE_PUBLIC_BASE_URL: https://resonate.example.com
+    RESONATE_IMAGES_DIR: /resonate-images
+  volumes:
+    - images-data:/resonate-images:ro
+```
+
+`RESONATE_PUBLIC_BASE_URL` must match the browser origin used in Resonate image
+URLs. Only canonical URLs of the form `/images/<filename>` on that origin are
+read from the mounted directory; all other image URLs continue through the
+existing public HTTP fetch path.
+
 ### LLM Settings
 
 ```toml

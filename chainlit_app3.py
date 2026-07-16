@@ -50,6 +50,7 @@ from reportlab.platypus import (
     Table,
     TableStyle,
 )
+from resonate_images import read_resonate_overlay
 
 
 
@@ -112,6 +113,8 @@ S3_FETCH_TIMEOUT_SECONDS = 30
 REFRESH_WINDOW_MESSAGE = "resonate:refresh"
 PDF_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 PDF_IMAGE_MAX_PIXELS = (1400, 1400)
+RESONATE_IMAGES_DIR = os.environ.get("RESONATE_IMAGES_DIR")
+RESONATE_PUBLIC_BASE_URL = os.environ.get("RESONATE_PUBLIC_BASE_URL")
 REMOTE_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\((https?://[^\s)]+)\)", re.IGNORECASE)
 MARKDOWN_AST = mistune.create_markdown(renderer="ast", plugins=["table"])
 
@@ -172,7 +175,16 @@ def _is_public_image_url(url: str) -> bool:
 
 
 def fetch_remote_image(url: str) -> bytes:
-    """Download one public image for PDF embedding, with SSRF and size limits."""
+    """Read a trusted local overlay or download one public image for PDF export."""
+    resonate_overlay = read_resonate_overlay(
+        url,
+        public_base_url=RESONATE_PUBLIC_BASE_URL,
+        images_dir=RESONATE_IMAGES_DIR,
+        max_bytes=PDF_IMAGE_MAX_BYTES,
+    )
+    if resonate_overlay is not None:
+        return resonate_overlay
+
     if not _is_public_image_url(url):
         raise ValueError("Image URL is not a public HTTP(S) address.")
 
