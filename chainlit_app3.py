@@ -106,6 +106,7 @@ def build_mcp_servers(config):
 config = load_config()
 
 LLM_STREAM_TIMEOUT_SECONDS = 300
+LLM_TIMEOUT_DECISION_SECONDS = 600
 ANTHROPIC_MAX_TOKENS = 4096
 MCP_DISCOVERY_TIMEOUT_SECONDS = 60
 MCP_TOOL_TIMEOUT_SECONDS = 240
@@ -117,6 +118,10 @@ RESONATE_IMAGES_DIR = os.environ.get("RESONATE_IMAGES_DIR")
 RESONATE_PUBLIC_BASE_URL = os.environ.get("RESONATE_PUBLIC_BASE_URL")
 REMOTE_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\((https?://[^\s)]+)\)", re.IGNORECASE)
 MARKDOWN_AST = mistune.create_markdown(renderer="ast", plugins=["table"])
+
+
+class LLMResponseTimeout(RuntimeError):
+    """Raised when one model-response attempt exceeds its allowed duration."""
 
 MODEL = config["llm"]["model"]
 DEFAULT_LLM_PROVIDER = config["llm"].get("provider", "openai-compatible")
@@ -472,6 +477,7 @@ class ChatAgent:
         self.mcp_clients = []
         self.export_entries: list[dict] = []
         self._current_response_images: list[dict] = []
+        self._active_response_msg: cl.Message | None = None
         self._init_messages()
 
     def _init_messages(self):
@@ -667,7 +673,7 @@ class ChatAgent:
             try:
                 full_content, tool_calls, assistant_blocks = await self._anthropic_response(response_msg)
             except TimeoutError as e:
-                raise RuntimeError(
+                raise LLMResponseTimeout(
                     f"Timed out after {LLM_STREAM_TIMEOUT_SECONDS}s while waiting for the model response."
                 ) from e
 
@@ -712,6 +718,7 @@ class ChatAgent:
                 self.anthropic_messages.append({"role": "user", "content": tool_results})
                 response_msg = cl.Message(content="")
                 await response_msg.send()
+                self._active_response_msg = response_msg
                 continue
 
             response_msg.content = full_content
@@ -724,11 +731,28 @@ class ChatAgent:
             )
             return full_content
 
-    async def chat(self, user_message: str, response_msg: cl.Message) -> str:
-        self.messages.append({"role": "user", "content": user_message})
-        self.anthropic_messages.append({"role": "user", "content": user_message})
-        self.export_entries.append({"kind": "user", "content": user_message})
-        self._current_response_images = []
+    async def chat(
+        self,
+        user_message: str | None,
+        response_msg: cl.Message,
+        *,
+        resume: bool = False,
+    ) -> str:
+        """Run one agent turn, optionally resuming a timed-out model attempt.
+
+        A resumed attempt deliberately does not add another user message: the
+        original prompt, any tool calls, and their results are already in the
+        session history.
+        """
+        if not resume:
+            if user_message is None:
+                raise ValueError("user_message is required for a new chat turn.")
+            self.messages.append({"role": "user", "content": user_message})
+            self.anthropic_messages.append({"role": "user", "content": user_message})
+            self.export_entries.append({"kind": "user", "content": user_message})
+            self._current_response_images = []
+
+        self._active_response_msg = response_msg
 
         if self.provider == "anthropic":
             return await self._chat_anthropic(response_msg)
@@ -784,7 +808,7 @@ class ChatAgent:
                                     if tc.function.arguments:
                                         tool_calls_by_index[index]["function"]["arguments"] += tc.function.arguments
             except TimeoutError as e:
-                raise RuntimeError(
+                raise LLMResponseTimeout(
                     f"Timed out after {LLM_STREAM_TIMEOUT_SECONDS}s while waiting for the model response."
                 ) from e
 
@@ -874,6 +898,7 @@ class ChatAgent:
                 # New response message for the final answer after tool calls.
                 response_msg = cl.Message(content="")
                 await response_msg.send()
+                self._active_response_msg = response_msg
 
                 continue
 
@@ -898,6 +923,10 @@ class ChatAgent:
 
             return final_response
 
+    async def continue_chat(self, response_msg: cl.Message) -> str:
+        """Retry the last model turn after an LLM stream timeout."""
+        return await self.chat(None, response_msg, resume=True)
+
 
 async def send_pdf_export(agent: ChatAgent, mode: str):
     pdf_data = await asyncio.to_thread(build_chat_pdf, agent.export_entries, mode)
@@ -911,6 +940,41 @@ async def send_pdf_export(agent: ChatAgent, mode: str):
     await cl.Message(
         content=f"Your {mode}-only PDF export is ready.", elements=[export_file]
     ).send()
+
+
+async def ask_to_continue_after_llm_timeout(
+    agent: ChatAgent, fallback_message: cl.Message
+) -> bool:
+    """Let the user choose whether to retry a timed-out model response."""
+    status_message = agent._active_response_msg or fallback_message
+    status_message.content = (
+        f"The model did not respond within {LLM_STREAM_TIMEOUT_SECONDS // 60} minutes. "
+        "Work completed so far has been kept."
+    )
+    await status_message.update()
+
+    choice = await cl.AskActionMessage(
+        content=(
+            "The model may be busy. Would you like to try again for another "
+            f"{LLM_STREAM_TIMEOUT_SECONDS // 60} minutes?"
+        ),
+        actions=[
+            cl.Action(
+                name="continue_llm_wait",
+                payload={},
+                label="Continue waiting",
+                tooltip="Retry the model using the work already completed.",
+            ),
+            cl.Action(
+                name="stop_llm_wait",
+                payload={},
+                label="Stop for now",
+                tooltip="Keep the current session and resume later with 'go on'.",
+            ),
+        ],
+        timeout=LLM_TIMEOUT_DECISION_SECONDS,
+    ).send()
+    return choice is not None and choice["name"] == "continue_llm_wait"
 
 
 @cl.on_chat_start
@@ -1069,8 +1133,28 @@ async def on_message(message: cl.Message):
     await response_msg.send()
 
     try:
-        await agent.chat(user_text, response_msg=response_msg)
-        await cl.send_window_message(REFRESH_WINDOW_MESSAGE)
+        resume = False
+        while True:
+            try:
+                if resume:
+                    await agent.continue_chat(response_msg=response_msg)
+                else:
+                    await agent.chat(user_text, response_msg=response_msg)
+                await cl.send_window_message(REFRESH_WINDOW_MESSAGE)
+                return
+            except LLMResponseTimeout:
+                if not await ask_to_continue_after_llm_timeout(agent, response_msg):
+                    await cl.Message(
+                        content=(
+                            "Stopped for now. Send **go on** when you want to retry "
+                            "from the work already completed."
+                        )
+                    ).send()
+                    return
+
+                response_msg = cl.Message(content="")
+                await response_msg.send()
+                resume = True
 
     except Exception as e:
         error_text = str(e) or e.__class__.__name__
