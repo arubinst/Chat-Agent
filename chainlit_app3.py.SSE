@@ -17,8 +17,6 @@ from openai import AsyncOpenAI
 from fastmcp import Client
 from fastmcp.client.transports import StdioTransport
 
-import boto3
-from botocore.config import Config
 
 
 
@@ -68,51 +66,10 @@ llm = AsyncOpenAI(
 LLM_STREAM_TIMEOUT_SECONDS = 300
 MCP_DISCOVERY_TIMEOUT_SECONDS = 60
 MCP_TOOL_TIMEOUT_SECONDS = 240
-S3_FETCH_TIMEOUT_SECONDS = 30
 REFRESH_WINDOW_MESSAGE = "resonate:refresh"
 
 MODEL = config["llm"]["model"]
 MCP_SERVERS = build_mcp_servers(config)
-
-_storage_cfg = config["storage"]
-_s3 = boto3.client(
-    "s3",
-    endpoint_url=_storage_cfg["endpoint_url"],
-    aws_access_key_id=_storage_cfg["access_key_id"],
-    aws_secret_access_key=_storage_cfg["secret_access_key"],
-    region_name=_storage_cfg.get("region", "eu-central-1"),
-    config=Config(s3={"addressing_style": "path"}),
-)
-S3_BUCKET = _storage_cfg["bucket"]
-
-
-def fetch_image(image_id: str) -> tuple[bytes, str]:
-    obj = _s3.get_object(Bucket=S3_BUCKET, Key=image_id)
-    return obj["Body"].read(), obj.get("ContentType", "application/octet-stream")
-
-
-LOCAL_TOOL_SCHEMAS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "display_image",
-            "description": (
-                "Display a stored image to the user in the conversation, by its "
-                "image_id (the SHA-256 returned by ingest_image or stored in MongoDB). "
-                "Call this whenever the user should actually see an image you found."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "image_id": {"type": "string", "description": "SHA-256 key of the stored image."},
-                    "caption": {"type": "string", "description": "Optional short caption."},
-                },
-                "required": ["image_id"],
-            },
-        },
-    }
-]
-
 
 def strip_thinking(text: str) -> str:
     if text is None:
@@ -128,10 +85,8 @@ class ChatAgent:
     def __init__(self, system_prompt: str | None = None):
         self.system_prompt = system_prompt
         self.messages = []
-        #self.tools = []
-        # modified to include the dismplay_image tool as a local tool available to the agent, in addition to any tools discovered from MCP servers
-        self.tools = list(LOCAL_TOOL_SCHEMAS)
-        self.local_tools = {"display_image": self._display_image}
+        self.tools = []
+        self.local_tools = {}
         self.mcp_clients = []
         self._init_messages()
 
@@ -219,22 +174,6 @@ class ChatAgent:
                 return tool.get("_client")
         return None
     
-    async def _display_image(self, args: dict) -> str:
-        image_id = args.get("image_id")
-        caption = args.get("caption") or ""
-        if not image_id:
-            return "Error: image_id is required."
-        try:
-            async with asyncio.timeout(S3_FETCH_TIMEOUT_SECONDS):
-                data, _ctype = await asyncio.to_thread(fetch_image, image_id)
-        except TimeoutError:
-            return f"Error: timed out after {S3_FETCH_TIMEOUT_SECONDS}s while fetching image {image_id}."
-        except Exception as e:
-            return f"Error: could not fetch image {image_id}: {e}"
-        img = cl.Image(name=image_id, content=data, display="inline")
-        await cl.Message(content=caption, elements=[img]).send()
-        return f"Displayed image {image_id} to the user."
-
     def _tools_for_api(self):
         return [
             {"type": t["type"], "function": t["function"]}

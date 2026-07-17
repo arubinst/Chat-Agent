@@ -31,8 +31,6 @@ from fastmcp.client.transports import (
     StreamableHttpTransport,
 )
 
-import boto3
-from botocore.config import Config
 from PIL import Image as PILImage
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -110,7 +108,6 @@ LLM_TIMEOUT_DECISION_SECONDS = 600
 ANTHROPIC_MAX_TOKENS = 4096
 MCP_DISCOVERY_TIMEOUT_SECONDS = 60
 MCP_TOOL_TIMEOUT_SECONDS = 240
-S3_FETCH_TIMEOUT_SECONDS = 30
 REFRESH_WINDOW_MESSAGE = "resonate:refresh"
 PDF_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 PDF_IMAGE_MAX_PIXELS = (1400, 1400)
@@ -126,23 +123,6 @@ class LLMResponseTimeout(RuntimeError):
 MODEL = config["llm"]["model"]
 DEFAULT_LLM_PROVIDER = config["llm"].get("provider", "openai-compatible")
 MCP_SERVERS = build_mcp_servers(config)
-
-_storage_cfg = config["storage"]
-_s3 = boto3.client(
-    "s3",
-    endpoint_url=_storage_cfg["endpoint_url"],
-    aws_access_key_id=_storage_cfg["access_key_id"],
-    aws_secret_access_key=_storage_cfg["secret_access_key"],
-    region_name=_storage_cfg.get("region", "eu-central-1"),
-    config=Config(s3={"addressing_style": "path"}),
-)
-S3_BUCKET = _storage_cfg["bucket"]
-
-
-def fetch_image(image_id: str) -> tuple[bytes, str]:
-    obj = _s3.get_object(Bucket=S3_BUCKET, Key=image_id)
-    return obj["Body"].read(), obj.get("ContentType", "application/octet-stream")
-
 
 def validate_llm_endpoint(endpoint: str) -> str:
     """Validate and normalize an OpenAI-compatible API base URL."""
@@ -399,11 +379,10 @@ def build_chat_pdf(entries: list[dict], mode: str) -> bytes:
         heading = "You" if kind == "user" else "Assistant"
         story.append(Paragraph(heading, styles["Heading2"]))
         story.extend(_pdf_markdown(entry["content"], markdown_styles, document.width))
-        image_sources = [("remote", url, "") for url in REMOTE_IMAGE_PATTERN.findall(entry["content"])]
-        image_sources.extend(("s3", image["image_id"], image["caption"]) for image in entry.get("images", []))
-        for source_type, source, caption in image_sources:
+        image_sources = [(url, "") for url in REMOTE_IMAGE_PATTERN.findall(entry["content"])]
+        for source, caption in image_sources:
             try:
-                data = fetch_image(source)[0] if source_type == "s3" else fetch_remote_image(source)
+                data = fetch_remote_image(source)
                 story.append(_pdf_image(data, document.width))
                 if caption:
                     story.append(Paragraph(html.escape(caption), styles["Italic"]))
@@ -414,29 +393,6 @@ def build_chat_pdf(entries: list[dict], mode: str) -> bytes:
         entry_index += 1
     document.build(story)
     return output.getvalue()
-
-
-LOCAL_TOOL_SCHEMAS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "display_image",
-            "description": (
-                "Display a stored image to the user in the conversation, by its "
-                "image_id (the SHA-256 returned by ingest_image or stored in MongoDB). "
-                "Call this whenever the user should actually see an image you found."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "image_id": {"type": "string", "description": "SHA-256 key of the stored image."},
-                    "caption": {"type": "string", "description": "Optional short caption."},
-                },
-                "required": ["image_id"],
-            },
-        },
-    }
-]
 
 
 def strip_thinking(text: str) -> str:
@@ -470,13 +426,10 @@ class ChatAgent:
         self.llm = self._build_llm_client()
         self.messages = []
         self.anthropic_messages = []
-        #self.tools = []
-        # modified to include the dismplay_image tool as a local tool available to the agent, in addition to any tools discovered from MCP servers
-        self.tools = list(LOCAL_TOOL_SCHEMAS)
-        self.local_tools = {"display_image": self._display_image}
+        self.tools = []
+        self.local_tools = {}
         self.mcp_clients = []
         self.export_entries: list[dict] = []
-        self._current_response_images: list[dict] = []
         self._active_response_msg: cl.Message | None = None
         self._init_messages()
 
@@ -491,7 +444,6 @@ class ChatAgent:
     def clear_history(self):
         self._init_messages()
         self.export_entries.clear()
-        self._current_response_images.clear()
 
     def _build_llm_client(self):
         if self.provider == "anthropic":
@@ -587,23 +539,6 @@ class ChatAgent:
                 return tool.get("_client")
         return None
     
-    async def _display_image(self, args: dict) -> str:
-        image_id = args.get("image_id")
-        caption = args.get("caption") or ""
-        if not image_id:
-            return "Error: image_id is required."
-        try:
-            async with asyncio.timeout(S3_FETCH_TIMEOUT_SECONDS):
-                data, _ctype = await asyncio.to_thread(fetch_image, image_id)
-        except TimeoutError:
-            return f"Error: timed out after {S3_FETCH_TIMEOUT_SECONDS}s while fetching image {image_id}."
-        except Exception as e:
-            return f"Error: could not fetch image {image_id}: {e}"
-        img = cl.Image(name=image_id, content=data, display="inline")
-        await cl.Message(content=caption, elements=[img]).send()
-        self._current_response_images.append({"image_id": image_id, "caption": caption})
-        return f"Displayed image {image_id} to the user."
-
     def _tools_for_api(self):
         return [
             {"type": t["type"], "function": t["function"]}
@@ -726,9 +661,7 @@ class ChatAgent:
             self.anthropic_messages.append(
                 {"role": "assistant", "content": [{"type": "text", "text": full_content}]}
             )
-            self.export_entries.append(
-                {"kind": "assistant", "content": full_content, "images": list(self._current_response_images)}
-            )
+            self.export_entries.append({"kind": "assistant", "content": full_content})
             return full_content
 
     async def chat(
@@ -750,7 +683,6 @@ class ChatAgent:
             self.messages.append({"role": "user", "content": user_message})
             self.anthropic_messages.append({"role": "user", "content": user_message})
             self.export_entries.append({"kind": "user", "content": user_message})
-            self._current_response_images = []
 
         self._active_response_msg = response_msg
 
@@ -913,13 +845,7 @@ class ChatAgent:
                     "content": full_content,
                 }
             )
-            self.export_entries.append(
-                {
-                    "kind": "assistant",
-                    "content": final_response,
-                    "images": list(self._current_response_images),
-                }
-            )
+            self.export_entries.append({"kind": "assistant", "content": final_response})
 
             return final_response
 
