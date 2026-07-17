@@ -1,4 +1,28 @@
 (() => {
+  // Chainlit 2.11.1 constructs ClipboardItem before checking whether a browser
+  // supports rich clipboard writes. Safari versions without ClipboardItem can
+  // still copy plain text with writeText(), so make Chainlit take that path.
+  if (typeof window.ClipboardItem === "undefined") {
+    window.ClipboardItem = class ClipboardItemFallback {
+      constructor(items) {
+        this.items = items;
+      }
+    };
+
+    const clipboard = navigator.clipboard;
+    if (clipboard?.writeText) {
+      try {
+        Object.defineProperty(clipboard, "write", {
+          configurable: true,
+          value: undefined,
+        });
+      } catch {
+        // Browsers that expose a non-configurable `write` will keep their
+        // native behavior; browsers needing this workaround use writeText.
+      }
+    }
+  }
+
   const dialogSelector = "#chat-settings";
   const label = "Restore config defaults and accept";
 
