@@ -138,8 +138,14 @@ MARKDOWN_AST = mistune.create_markdown(renderer="ast", plugins=["table"])
 class LLMResponseTimeout(RuntimeError):
     """Raised when one model-response attempt exceeds its allowed duration."""
 
+# GLM-5.x on vLLM honors only "high" (balanced) and treats every other value
+# as "max" (deepest, the default); "none" disables thinking entirely via
+# chat_template_kwargs. "low"/"medium" are offered for non-GLM endpoints.
+REASONING_EFFORT_CHOICES = {"default", "none", "low", "medium", "high", "max"}
+
 MODEL = config["llm"]["model"]
 DEFAULT_LLM_PROVIDER = config["llm"].get("provider", "openai-compatible")
+DEFAULT_REASONING_EFFORT = config["llm"].get("reasoning_effort", "default")
 MCP_SERVERS = build_mcp_servers(config)
 
 def validate_llm_endpoint(endpoint: str) -> str:
@@ -168,6 +174,16 @@ def normalize_llm_provider(provider: str) -> str:
     return normalized
 
 
+def normalize_reasoning_effort(value: str) -> str:
+    normalized = (value or "").strip().lower() or "default"
+    if normalized not in REASONING_EFFORT_CHOICES:
+        raise ValueError(
+            "Reasoning effort must be one of: "
+            + ", ".join(sorted(REASONING_EFFORT_CHOICES))
+        )
+    return normalized
+
+
 def normalize_llm_endpoint(endpoint: str, provider: str) -> str:
     normalized = validate_llm_endpoint(endpoint)
     parsed = urlparse(normalized)
@@ -189,6 +205,7 @@ def restore_config_defaults(agent: "ChatAgent"):
         config["llm"]["api_key"],
         config["llm"]["model"],
         DEFAULT_LLM_PROVIDER,
+        DEFAULT_REASONING_EFFORT,
     )
 
 
@@ -471,6 +488,7 @@ class ChatAgent:
         api_key: str = config["llm"]["api_key"],
         model: str = MODEL,
         provider: str = DEFAULT_LLM_PROVIDER,
+        reasoning_effort: str = DEFAULT_REASONING_EFFORT,
     ):
         provider = normalize_llm_provider(provider)
         self.system_prompt = system_prompt
@@ -478,6 +496,7 @@ class ChatAgent:
         self.base_url = normalize_llm_endpoint(base_url, self.provider)
         self.api_key = api_key
         self.model = model
+        self.reasoning_effort = normalize_reasoning_effort(reasoning_effort)
         self.llm = self._build_llm_client()
         self.messages = []
         self.anthropic_messages = []
@@ -506,17 +525,26 @@ class ChatAgent:
             return AsyncAnthropic(api_key=self.api_key, base_url=self.base_url)
         return AsyncOpenAI(base_url=self.base_url, api_key=self.api_key)
 
-    def update_llm_connection(self, base_url: str, api_key: str, model: str, provider: str):
+    def update_llm_connection(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        provider: str,
+        reasoning_effort: str = "default",
+    ):
         """Replace this session's LLM settings without changing shared config."""
         model = model.strip()
         if not model:
             raise ValueError("Model must not be empty.")
         provider = normalize_llm_provider(provider)
+        reasoning_effort = normalize_reasoning_effort(reasoning_effort)
 
         self.base_url = normalize_llm_endpoint(base_url, provider)
         self.api_key = api_key
         self.model = model
         self.provider = provider
+        self.reasoning_effort = reasoning_effort
         self.llm = self._build_llm_client()
         self.clear_history()
 
@@ -601,6 +629,26 @@ class ChatAgent:
             {"type": t["type"], "function": t["function"]}
             for t in self.tools
         ]
+
+    def _reasoning_request_kwargs(self) -> dict:
+        """Extra request fields controlling reasoning on OpenAI-compatible endpoints.
+
+        GLM-5.x on vLLM reads chat_template_kwargs (enable_thinking, and
+        reasoning_effort where only "high" lowers effort — anything else means
+        "max"); other endpoints read the top-level reasoning_effort field, so
+        both are sent. The Anthropic path is intentionally left untouched.
+        """
+        effort = self.reasoning_effort
+        if self.provider == "anthropic" or effort == "default":
+            return {}
+        if effort == "none":
+            return {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+        return {
+            "extra_body": {
+                "reasoning_effort": effort,
+                "chat_template_kwargs": {"reasoning_effort": effort},
+            }
+        }
 
     def _tools_for_anthropic(self):
         return [
@@ -765,6 +813,7 @@ class ChatAgent:
                         tools=self._tools_for_api() if self.tools else None,
                         tool_choice="auto" if self.tools else None,
                         stream=True,
+                        **self._reasoning_request_kwargs(),
                     )
                     _debug_stream("stream opened, waiting for first chunk")
 
@@ -986,6 +1035,24 @@ def build_llm_settings(agent: ChatAgent) -> cl.ChatSettings:
                 description="Model name used for this browser session.",
                 placeholder="gemma4:latest",
             ),
+            cl.input_widget.Select(
+                id="llm_reasoning_effort",
+                label="Reasoning effort",
+                initial_value=agent.reasoning_effort,
+                items={
+                    "Default (endpoint decides)": "default",
+                    "Off — no thinking": "none",
+                    "Low (non-GLM endpoints only)": "low",
+                    "Medium (non-GLM endpoints only)": "medium",
+                    "High (GLM: balanced)": "high",
+                    "Max (GLM: deepest, its default)": "max",
+                },
+                description=(
+                    "OpenAI-compatible endpoints only; ignored for Anthropic. "
+                    "GLM-5.x honors Off, High (balanced) and Max (deepest); it "
+                    "treats Low/Medium as Max."
+                ),
+            ),
         ]
     )
 
@@ -1085,9 +1152,11 @@ async def on_settings_update(settings: dict):
     api_key = submitted_key.strip() or agent.api_key
     model = str(settings.get("llm_model", ""))
     provider = str(settings.get("llm_provider", ""))
+    reasoning_effort = str(settings.get("llm_reasoning_effort", "default"))
 
     try:
         provider = normalize_llm_provider(provider)
+        reasoning_effort = normalize_reasoning_effort(reasoning_effort)
         normalized_endpoint = normalize_llm_endpoint(endpoint, provider)
         is_config_reset = (
             provider == DEFAULT_LLM_PROVIDER
@@ -1095,12 +1164,13 @@ async def on_settings_update(settings: dict):
             == normalize_llm_endpoint(config["llm"]["base_url"], DEFAULT_LLM_PROVIDER)
             and model.strip() == config["llm"]["model"]
             and not submitted_key.strip()
+            and reasoning_effort == normalize_reasoning_effort(DEFAULT_REASONING_EFFORT)
         )
         if is_config_reset:
             restore_config_defaults(agent)
             await build_llm_settings(agent).send()
         else:
-            agent.update_llm_connection(endpoint, api_key, model, provider)
+            agent.update_llm_connection(endpoint, api_key, model, provider, reasoning_effort)
     except (TypeError, ValueError) as e:
         await cl.Message(content=f"Could not update LLM connection: {e}").send()
         return

@@ -9,6 +9,11 @@ provider = "openai-compatible"
 base_url = "http://localhost:11434/v1"  # Ollama default
 api_key = "ollama"                       # API key (use "ollama" for Ollama)
 model = "qwen2.5"                        # Model name
+# Optional reasoning control for OpenAI-compatible endpoints (ignored for
+# Anthropic): "default" (endpoint decides), "none" (disable thinking),
+# "low", "medium", "high", "max". GLM-5.x only honors "none", "high"
+# (balanced) and "max" (deepest, its default); it treats low/medium as max.
+#reasoning_effort = "default"
 # Optional system prompt to set assistant behavior
 system_prompt = "You are a helpful assistant running in a terminal. Format responses in plain text, not markdown."
 
