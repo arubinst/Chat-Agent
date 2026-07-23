@@ -890,6 +890,50 @@ async def send_pdf_export(agent: ChatAgent, mode: str):
     ).send()
 
 
+def build_llm_settings(agent: ChatAgent) -> cl.ChatSettings:
+    return cl.ChatSettings(
+        [
+            cl.input_widget.Select(
+                id="llm_provider",
+                label="LLM provider",
+                initial_value=agent.provider,
+                items={
+                    "OpenAI-compatible": "openai-compatible",
+                    "Anthropic / Claude": "anthropic",
+                },
+                description="Select Anthropic / Claude only for the native Anthropic Messages API.",
+            ),
+            cl.input_widget.TextInput(
+                id="llm_endpoint",
+                label="LLM endpoint",
+                initial=agent.base_url,
+                description=(
+                    "Base URL used for this browser session. For native Anthropic, "
+                    "use https://api.anthropic.com (without /v1)."
+                ),
+                placeholder="https://api.example.com/v1",
+            ),
+            cl.input_widget.TextInput(
+                id="llm_api_key",
+                label="LLM API key",
+                initial="",
+                description=(
+                    "Enter a key to replace the current session key. Leave blank "
+                    "to keep the configured key. This field is not prefilled."
+                ),
+                placeholder="Leave blank to retain the current key",
+            ),
+            cl.input_widget.TextInput(
+                id="llm_model",
+                label="Model",
+                initial=agent.model,
+                description="Model name used for this browser session.",
+                placeholder="gemma4:latest",
+            ),
+        ]
+    )
+
+
 async def ask_to_continue_after_llm_timeout(
     agent: ChatAgent, fallback_message: cl.Message
 ) -> bool:
@@ -934,47 +978,7 @@ async def on_chat_start():
     )
     cl.user_session.set("agent", agent)
 
-    settings = cl.ChatSettings(
-        [
-            cl.input_widget.Select(
-                id="llm_provider",
-                label="LLM provider",
-                initial=agent.provider,
-                items={
-                    "openai-compatible": "OpenAI-compatible",
-                    "anthropic": "Anthropic / Claude",
-                },
-                description="Select Anthropic / Claude only for the native Anthropic Messages API.",
-            ),
-            cl.input_widget.TextInput(
-                id="llm_endpoint",
-                label="LLM endpoint",
-                initial=agent.base_url,
-                description=(
-                    "Base URL used for this browser session. For native Anthropic, "
-                    "use https://api.anthropic.com (without /v1)."
-                ),
-                placeholder="https://api.example.com/v1",
-            ),
-            cl.input_widget.TextInput(
-                id="llm_api_key",
-                label="LLM API key",
-                initial="",
-                description=(
-                    "Enter a key to replace the current session key. Leave blank "
-                    "to keep the configured key. This field is not prefilled."
-                ),
-                placeholder="Leave blank to retain the current key",
-            ),
-            cl.input_widget.TextInput(
-                id="llm_model",
-                label="Model",
-                initial=agent.model,
-                description="Model name used for this browser session.",
-                placeholder="gemma4:latest",
-            ),
-        ]
-    )
+    settings = build_llm_settings(agent)
     await settings.send()
 
     msg = cl.Message(content="Discovering MCP servers and tools...")
@@ -1028,15 +1032,26 @@ async def on_settings_update(settings: dict):
 
     try:
         provider = normalize_llm_provider(provider)
-        is_config_reset = (
-            provider == DEFAULT_LLM_PROVIDER
-            and normalize_llm_endpoint(endpoint, provider)
-            == normalize_llm_endpoint(config["llm"]["base_url"], DEFAULT_LLM_PROVIDER)
-            and model.strip() == config["llm"]["model"]
+        normalized_endpoint = normalize_llm_endpoint(endpoint, provider)
+        is_current_runtime_settings = (
+            provider == agent.provider
+            and normalized_endpoint == agent.base_url
+            and model.strip() == agent.model
             and not submitted_key.strip()
+        )
+        is_config_reset = (
+            is_current_runtime_settings
+            or (
+                provider == DEFAULT_LLM_PROVIDER
+                and normalized_endpoint
+                == normalize_llm_endpoint(config["llm"]["base_url"], DEFAULT_LLM_PROVIDER)
+                and model.strip() == config["llm"]["model"]
+                and not submitted_key.strip()
+            )
         )
         if is_config_reset:
             restore_config_defaults(agent)
+            await build_llm_settings(agent).send()
         else:
             agent.update_llm_connection(endpoint, api_key, model, provider)
     except (TypeError, ValueError) as e:
