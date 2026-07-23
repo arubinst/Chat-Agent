@@ -110,9 +110,10 @@ MCP_DISCOVERY_TIMEOUT_SECONDS = 60
 MCP_TOOL_TIMEOUT_SECONDS = 240
 # Some serving stacks (e.g. vLLM's GLM tool-call parser) drop streamed tool
 # calls whose arguments are empty: streaming deltas are only emitted while
-# argument tokens arrive, and a zero-argument call produces none. Padding
-# zero-argument tools with one required parameter guarantees argument tokens;
-# the parameter is stripped again before the real MCP call.
+# argument tokens arrive, and a call with `{}` arguments produces none. Any
+# tool without required parameters can be legally called with `{}`, so those
+# get one required pad parameter to guarantee argument tokens; it is stripped
+# again before the real MCP call.
 ZERO_ARG_PAD_PARAM = "call_reason"
 ZERO_ARG_PAD_SCHEMA = {
     "type": "string",
@@ -432,12 +433,15 @@ def build_chat_pdf(entries: list[dict], mode: str) -> bytes:
 
 
 def pad_zero_arg_schema(parameters: dict | None) -> tuple[dict, bool]:
-    """Return (schema, was_padded); pads schemas that declare no parameters."""
+    """Return (schema, was_padded); pads schemas with no required parameters."""
     parameters = parameters or {"type": "object", "properties": {}}
-    if parameters.get("properties"):
+    if parameters.get("required"):
+        return parameters, False
+    properties = parameters.get("properties") or {}
+    if ZERO_ARG_PAD_PARAM in properties:
         return parameters, False
     padded = dict(parameters)
-    padded["properties"] = {ZERO_ARG_PAD_PARAM: ZERO_ARG_PAD_SCHEMA}
+    padded["properties"] = {**properties, ZERO_ARG_PAD_PARAM: ZERO_ARG_PAD_SCHEMA}
     padded["required"] = [ZERO_ARG_PAD_PARAM]
     return padded, True
 
