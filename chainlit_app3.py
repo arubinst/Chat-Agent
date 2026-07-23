@@ -108,6 +108,16 @@ LLM_TIMEOUT_DECISION_SECONDS = 600
 ANTHROPIC_MAX_TOKENS = 4096
 MCP_DISCOVERY_TIMEOUT_SECONDS = 60
 MCP_TOOL_TIMEOUT_SECONDS = 240
+# Some serving stacks (e.g. vLLM's GLM tool-call parser) drop streamed tool
+# calls whose arguments are empty: streaming deltas are only emitted while
+# argument tokens arrive, and a zero-argument call produces none. Padding
+# zero-argument tools with one required parameter guarantees argument tokens;
+# the parameter is stripped again before the real MCP call.
+ZERO_ARG_PAD_PARAM = "call_reason"
+ZERO_ARG_PAD_SCHEMA = {
+    "type": "string",
+    "description": "One short sentence explaining why you are calling this tool.",
+}
 REFRESH_WINDOW_MESSAGE = "resonate:refresh"
 PDF_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 PDF_IMAGE_MAX_PIXELS = (1400, 1400)
@@ -421,6 +431,17 @@ def build_chat_pdf(entries: list[dict], mode: str) -> bytes:
     return output.getvalue()
 
 
+def pad_zero_arg_schema(parameters: dict | None) -> tuple[dict, bool]:
+    """Return (schema, was_padded); pads schemas that declare no parameters."""
+    parameters = parameters or {"type": "object", "properties": {}}
+    if parameters.get("properties"):
+        return parameters, False
+    padded = dict(parameters)
+    padded["properties"] = {ZERO_ARG_PAD_PARAM: ZERO_ARG_PAD_SCHEMA}
+    padded["required"] = [ZERO_ARG_PAD_PARAM]
+    return padded, True
+
+
 def strip_thinking(text: str) -> str:
     if text is None:
         return ""
@@ -450,6 +471,7 @@ class ChatAgent:
         self.messages = []
         self.anthropic_messages = []
         self.tools = []
+        self.padded_tools: set[str] = set()
         self.local_tools = {}
         self.mcp_clients = []
         self.export_entries: list[dict] = []
@@ -513,14 +535,16 @@ class ChatAgent:
                 self.mcp_clients.append((server_name, client))
 
                 for t in server_tools:
+                    parameters, was_padded = pad_zero_arg_schema(t.inputSchema)
+                    if was_padded:
+                        self.padded_tools.add(t.name)
                     self.tools.append(
                         {
                             "type": "function",
                             "function": {
                                 "name": t.name,
                                 "description": t.description or "No description",
-                                "parameters": t.inputSchema
-                                or {"type": "object", "properties": {}},
+                                "parameters": parameters,
                             },
                             "_client": client,
                         }
@@ -646,6 +670,8 @@ class ChatAgent:
                     except json.JSONDecodeError as e:
                         result_text = f"Error: invalid JSON arguments: {e}"
                     else:
+                        if tool_name in self.padded_tools:
+                            tool_args.pop(ZERO_ARG_PAD_PARAM, None)
                         if tool_name in self.local_tools:
                             try:
                                 result_text = await self.local_tools[tool_name](tool_args)
@@ -798,7 +824,10 @@ class ChatAgent:
                             }
                         )
                         continue
-                    
+
+                    if tool_name in self.padded_tools:
+                        tool_args.pop(ZERO_ARG_PAD_PARAM, None)
+
                     if tool_name in self.local_tools:
                         try:
                             result_text = await self.local_tools[tool_name](tool_args)
