@@ -119,6 +119,13 @@ ZERO_ARG_PAD_SCHEMA = {
     "type": "string",
     "description": "One short sentence explaining why you are calling this tool.",
 }
+# Set DEBUG_LLM_STREAM=1 to log one line per streamed chunk to stdout.
+DEBUG_LLM_STREAM = os.environ.get("DEBUG_LLM_STREAM", "") not in {"", "0", "false"}
+
+
+def _debug_stream(message: str):
+    if DEBUG_LLM_STREAM:
+        print(f"[llm-stream {datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3]}] {message}", flush=True)
 REFRESH_WINDOW_MESSAGE = "resonate:refresh"
 PDF_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 PDF_IMAGE_MAX_PIXELS = (1400, 1400)
@@ -746,6 +753,11 @@ class ChatAgent:
             tool_calls_by_index: dict[int, dict] = {}
 
             try:
+                _debug_stream(
+                    "request: "
+                    + ", ".join(f"{m['role']}" for m in self.messages)
+                    + f" | {len(self.tools)} tools"
+                )
                 async with asyncio.timeout(LLM_STREAM_TIMEOUT_SECONDS):
                     stream = await self.llm.chat.completions.create(
                         model=self.model,
@@ -754,12 +766,20 @@ class ChatAgent:
                         tool_choice="auto" if self.tools else None,
                         stream=True,
                     )
+                    _debug_stream("stream opened, waiting for first chunk")
 
                     async for chunk in stream:
                         if not chunk.choices:
+                            _debug_stream("chunk: no choices")
                             continue
 
                         delta = chunk.choices[0].delta
+                        _debug_stream(
+                            f"chunk: content={len(delta.content) if delta.content else 0}ch"
+                            f" reasoning={len(getattr(delta, 'reasoning_content', None) or '')}ch"
+                            f" tool_calls={len(delta.tool_calls) if delta.tool_calls else 0}"
+                            f" finish={chunk.choices[0].finish_reason}"
+                        )
 
                         if delta.content:
                             content_parts.append(delta.content)
@@ -798,6 +818,9 @@ class ChatAgent:
 
             full_content = "".join(content_parts)
             tool_calls = list(tool_calls_by_index.values())
+            _debug_stream(
+                f"stream done: {len(full_content)}ch content, {len(tool_calls)} tool call(s)"
+            )
 
             if tool_calls:
                 # Clean any partial streamed content before showing tool execution.
