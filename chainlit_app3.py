@@ -138,6 +138,32 @@ def validate_llm_endpoint(endpoint: str) -> str:
     return normalized
 
 
+def normalize_llm_provider(provider: str) -> str:
+    aliases = {
+        "openai-compatible": "openai-compatible",
+        "anthropic": "anthropic",
+        "anthropic / claude": "anthropic",
+    }
+    normalized = aliases.get(provider.strip().lower())
+    if normalized is None:
+        raise ValueError("Unsupported LLM provider.")
+    return normalized
+
+
+def normalize_llm_endpoint(endpoint: str, provider: str) -> str:
+    normalized = validate_llm_endpoint(endpoint)
+    parsed = urlparse(normalized)
+    # The Anthropic SDK appends /v1/messages itself. Accept the API endpoint
+    # commonly pasted from Anthropic's documentation as a convenience.
+    if (
+        provider == "anthropic"
+        and parsed.hostname == "api.anthropic.com"
+        and parsed.path.rstrip("/") == "/v1/messages"
+    ):
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return normalized
+
+
 def restore_config_defaults(agent: "ChatAgent"):
     """Restore all runtime LLM settings, including the non-displayed config key."""
     agent.update_llm_connection(
@@ -414,13 +440,10 @@ class ChatAgent:
         model: str = MODEL,
         provider: str = DEFAULT_LLM_PROVIDER,
     ):
-        if provider not in {"openai-compatible", "anthropic"}:
-            raise ValueError(
-                "llm.provider must be either 'openai-compatible' or 'anthropic'."
-            )
+        provider = normalize_llm_provider(provider)
         self.system_prompt = system_prompt
         self.provider = provider
-        self.base_url = validate_llm_endpoint(base_url)
+        self.base_url = normalize_llm_endpoint(base_url, self.provider)
         self.api_key = api_key
         self.model = model
         self.llm = self._build_llm_client()
@@ -455,10 +478,9 @@ class ChatAgent:
         model = model.strip()
         if not model:
             raise ValueError("Model must not be empty.")
-        if provider not in {"openai-compatible", "anthropic"}:
-            raise ValueError("Unsupported LLM provider.")
+        provider = normalize_llm_provider(provider)
 
-        self.base_url = validate_llm_endpoint(base_url)
+        self.base_url = normalize_llm_endpoint(base_url, provider)
         self.api_key = api_key
         self.model = model
         self.provider = provider
