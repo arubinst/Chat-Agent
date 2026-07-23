@@ -1151,12 +1151,14 @@ async def on_settings_update(settings: dict):
         ).send()
         return
 
-    endpoint = str(settings.get("llm_endpoint", ""))
-    submitted_key = str(settings.get("llm_api_key", ""))
+    # Chainlit returns None for empty text inputs; `or ""` keeps str(None)
+    # from turning into the literal string "None".
+    endpoint = str(settings.get("llm_endpoint") or "")
+    submitted_key = str(settings.get("llm_api_key") or "")
     api_key = submitted_key.strip() or agent.api_key
-    model = str(settings.get("llm_model", ""))
-    provider = str(settings.get("llm_provider", ""))
-    reasoning_effort = str(settings.get("llm_reasoning_effort", "default"))
+    model = str(settings.get("llm_model") or "")
+    provider = str(settings.get("llm_provider") or "")
+    reasoning_effort = str(settings.get("llm_reasoning_effort") or "default")
 
     try:
         provider = normalize_llm_provider(provider)
