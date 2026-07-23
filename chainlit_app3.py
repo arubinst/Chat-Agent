@@ -66,38 +66,36 @@ def load_config():
 
 
 def build_mcp_servers(config):
+    """Return (display_name, transport) pairs for the configured MCP servers."""
     servers = []
 
     for server in config.get("mcp_servers", []):
         server_type = server.get("type", "stdio")
         if server_type == "stdio":
-            servers.append(
-                StdioTransport(
-                    command=server["command"],
-                    args=server.get("args", []),
-                    cwd=server.get("cwd"),
-                    env=server.get("env"),
-                )
+            transport = StdioTransport(
+                command=server["command"],
+                args=server.get("args", []),
+                cwd=server.get("cwd"),
+                env=server.get("env"),
             )
         elif server_type == "streamable-http":
-            servers.append(
-                StreamableHttpTransport(
-                    url=server["url"],
-                    headers={
-                        "Authorization": (
-                            f"Bearer {os.environ['MCP_GATEWAY_AUTH_TOKEN']}"
-                        ),
-                    },
-                )
+            transport = StreamableHttpTransport(
+                url=server["url"],
+                headers={
+                    "Authorization": (
+                        f"Bearer {os.environ['MCP_GATEWAY_AUTH_TOKEN']}"
+                    ),
+                },
             )
         elif server_type == "sse":
-            servers.append(server["url"])
+            transport = server["url"]
         elif server_type == "file":
-            servers.append(server["path"])
+            transport = server["path"]
         else:
             raise ValueError(
                 f"Unsupported MCP server type: {server_type}"
             )
+        servers.append((server.get("name"), transport))
     return servers
 
 
@@ -554,8 +552,10 @@ class ChatAgent:
     async def connect(self):
         discovered = []
 
-        for server in MCP_SERVERS:
-            if isinstance(server, str):
+        for configured_name, server in MCP_SERVERS:
+            if configured_name:
+                server_name = configured_name
+            elif isinstance(server, str):
                 server_name = server
             elif isinstance(server, StdioTransport):
                 server_name = f"{server.command} {' '.join(server.args)}"
@@ -1107,7 +1107,9 @@ async def on_chat_start():
     settings = build_llm_settings(agent)
     await settings.send()
 
-    msg = cl.Message(content="Discovering MCP servers and tools...")
+    msg = cl.Message(
+        content="Discovering MCP servers and tools... this can take a moment, please wait."
+    )
     await msg.send()
 
     discovered = await agent.connect()
@@ -1122,15 +1124,16 @@ async def on_chat_start():
             ok_count += 1
             tool_count += len(item["tools"])
 
-            lines.append(f"✅ **{item['server']}**")
             if SHOW_MCP_TOOL_LIST:
+                lines.append(f"✅ **{item['server']}**")
                 for tool in item["tools"]:
                     lines.append(f"- `{tool}`")
+                lines.append("")
         else:
+            # Failed servers are always reported; that is actionable.
             lines.append(f"❌ **{item['server']}**")
             lines.append(f"- Error: `{item['error']}`")
-
-        lines.append("")
+            lines.append("")
 
     lines.append(f"**Total:** {tool_count} tools from {ok_count} MCP server(s).")
     lines.append("")
