@@ -126,6 +126,8 @@ DEBUG_LLM_STREAM = os.environ.get("DEBUG_LLM_STREAM", "") not in {"", "0", "fals
 def _debug_stream(message: str):
     if DEBUG_LLM_STREAM:
         print(f"[llm-stream {datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3]}] {message}", flush=True)
+
+
 REFRESH_WINDOW_MESSAGE = "resonate:refresh"
 PDF_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 PDF_IMAGE_MAX_PIXELS = (1400, 1400)
@@ -146,6 +148,7 @@ REASONING_EFFORT_CHOICES = {"default", "none", "low", "medium", "high", "max"}
 MODEL = config["llm"]["model"]
 DEFAULT_LLM_PROVIDER = config["llm"].get("provider", "openai-compatible")
 DEFAULT_REASONING_EFFORT = config["llm"].get("reasoning_effort", "default")
+SHOW_MCP_TOOL_LIST = config.get("display", {}).get("show_mcp_tool_list", False)
 MCP_SERVERS = build_mcp_servers(config)
 
 def validate_llm_endpoint(endpoint: str) -> str:
@@ -1120,8 +1123,9 @@ async def on_chat_start():
             tool_count += len(item["tools"])
 
             lines.append(f"✅ **{item['server']}**")
-            for tool in item["tools"]:
-                lines.append(f"- `{tool}`")
+            if SHOW_MCP_TOOL_LIST:
+                for tool in item["tools"]:
+                    lines.append(f"- `{tool}`")
         else:
             lines.append(f"❌ **{item['server']}**")
             lines.append(f"- Error: `{item['error']}`")

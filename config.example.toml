@@ -17,6 +17,11 @@ model = "qwen2.5"                        # Model name
 # Optional system prompt to set assistant behavior
 system_prompt = "You are a helpful assistant running in a terminal. Format responses in plain text, not markdown."
 
+[display]
+# Show every discovered MCP tool in the startup message. The connected-server
+# and total-tool counts are always shown.
+show_mcp_tool_list = false
+
 # MCP Server Configuration
 # Supported types: "stdio", "sse", "file"
 
