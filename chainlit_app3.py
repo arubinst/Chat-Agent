@@ -1027,9 +1027,11 @@ async def on_settings_update(settings: dict):
     provider = str(settings.get("llm_provider", ""))
 
     try:
+        provider = normalize_llm_provider(provider)
         is_config_reset = (
             provider == DEFAULT_LLM_PROVIDER
-            and validate_llm_endpoint(endpoint) == validate_llm_endpoint(config["llm"]["base_url"])
+            and normalize_llm_endpoint(endpoint, provider)
+            == normalize_llm_endpoint(config["llm"]["base_url"], DEFAULT_LLM_PROVIDER)
             and model.strip() == config["llm"]["model"]
             and not submitted_key.strip()
         )
