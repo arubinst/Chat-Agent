@@ -1033,21 +1033,12 @@ async def on_settings_update(settings: dict):
     try:
         provider = normalize_llm_provider(provider)
         normalized_endpoint = normalize_llm_endpoint(endpoint, provider)
-        is_current_runtime_settings = (
-            provider == agent.provider
-            and normalized_endpoint == agent.base_url
-            and model.strip() == agent.model
-            and not submitted_key.strip()
-        )
         is_config_reset = (
-            is_current_runtime_settings
-            or (
-                provider == DEFAULT_LLM_PROVIDER
-                and normalized_endpoint
-                == normalize_llm_endpoint(config["llm"]["base_url"], DEFAULT_LLM_PROVIDER)
-                and model.strip() == config["llm"]["model"]
-                and not submitted_key.strip()
-            )
+            provider == DEFAULT_LLM_PROVIDER
+            and normalized_endpoint
+            == normalize_llm_endpoint(config["llm"]["base_url"], DEFAULT_LLM_PROVIDER)
+            and model.strip() == config["llm"]["model"]
+            and not submitted_key.strip()
         )
         if is_config_reset:
             restore_config_defaults(agent)

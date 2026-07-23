@@ -72,16 +72,6 @@
     resetButton.setAttribute("aria-label", label);
     resetButton.title = label;
 
-    resetButton.addEventListener("click", () => {
-      // Let Chainlit reset its form to initial values, then accept those values.
-      window.setTimeout(() => {
-        const activeDialog = document.querySelector(dialogSelector);
-        const activeAcceptButton = activeDialog?.querySelector(
-          "#confirm, #confirm-sidebar"
-        );
-        activeAcceptButton?.click();
-      }, 0);
-    });
   }
 
   new MutationObserver(customizeResetButton).observe(document.documentElement, {
@@ -89,4 +79,23 @@
     subtree: true,
   });
   customizeResetButton();
+
+  // Chainlit's built-in Reset only restores values from when the dialog was
+  // opened. A reload creates a fresh session from config.toml instead, which
+  // also restores the configured API key without exposing it in the form.
+  document.addEventListener(
+    "click",
+    (event) => {
+      const button = event.target.closest("button");
+      const dialog = button?.closest(dialogSelector);
+      const acceptButton = dialog?.querySelector("#confirm, #confirm-sidebar");
+      const resetButton = acceptButton?.parentElement?.querySelector("button");
+      if (!button || button !== resetButton) return;
+
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      window.location.reload();
+    },
+    true
+  );
 })();
